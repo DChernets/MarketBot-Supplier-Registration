@@ -240,6 +240,12 @@ class MarketBot:
         elif query.data == 'back_to_profile':
             logger.info(f"handle_callback: calling profile_command")
             await self.profile_command(update, context)
+        elif query.data == 'process_photos_ready':
+            logger.info(f"handle_callback: calling process_photo_recognition")
+            await self.process_photo_recognition(update, context)
+        elif query.data == 'cancel_photo_upload':
+            logger.info(f"handle_callback: calling cancel_photo_recognition")
+            await self.cancel_photo_recognition(update, context)
         else:
             logger.warning(f"handle_callback: unknown callback data pattern: {query.data}")
 
@@ -1036,10 +1042,21 @@ class MarketBot:
 
             context.user_data['uploaded_photos'] = photos
 
+            # Создаем клавиатуру с кнопками
+            keyboard = []
+
+            if len(photos) > 0:
+                keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="process_photos_ready")])
+
+            keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_photo_upload")])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
             await update.message.reply_text(
                 f"✅ Фото {len(photos)} загружено\n"
                 f"Всего загружено: {len(photos)}/10\n\n"
-                "Отправьте еще фото или напишите 'Готово' для обработки"
+                "Отправьте еще фото или используйте кнопки ниже:",
+                reply_markup=reply_markup
             )
 
         except Exception as e:
@@ -1074,11 +1091,19 @@ class MarketBot:
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            await update.message.reply_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
+            # Определяем тип update для ответа
+            if hasattr(update, 'callback_query') and update.callback_query:
+                await update.callback_query.edit_message_text(
+                    message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
 
         except Exception as e:
             logger.error(f"Error in show_photo_confirmation: {e}")
@@ -1094,11 +1119,18 @@ class MarketBot:
             context.user_data['uploaded_photos'] = []
             context.user_data['state'] = PHOTO_UPLOAD
 
+            # Создаем клавиатуру с кнопками
+            keyboard = [
+                [InlineKeyboardButton("❌ Отмена", callback_data="cancel_photo_upload")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
             await query.edit_message_text(
                 "📸 *Распознавание товаров*\n\n"
                 "Пожалуйста, отправьте фотографии товаров (максимум 10 штук).\n"
-                "После загрузки всех фото напишите 'Готово' для распознавания.\n\n"
-                "Отправьте фото или напишите 'Отмена' для выхода:",
+                "После загрузки всех фото используйте кнопку '✅ Готово' для распознавания.\n\n"
+                "Отправьте фото или используйте кнопки ниже:",
+                reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
 
@@ -1380,10 +1412,18 @@ class MarketBot:
             uploaded_photos = context.user_data.get('uploaded_photos', [])
 
             if not uploaded_photos:
-                await update.message.reply_text("❌ Нет загруженных фото")
+                # Определяем тип update для ответа
+                if hasattr(update, 'callback_query') and update.callback_query:
+                    await update.callback_query.edit_message_text("❌ Нет загруженных фото")
+                else:
+                    await update.message.reply_text("❌ Нет загруженных фото")
                 return
 
-            await update.message.reply_text("🔄 Начинаю распознавание товаров...")
+            # Определяем тип update для ответа
+            if hasattr(update, 'callback_query') and update.callback_query:
+                await update.callback_query.edit_message_text("🔄 Начинаю распознавание товаров...")
+            else:
+                await update.message.reply_text("🔄 Начинаю распознавание товаров...")
 
             # Инициализируем сервисы если необходимо
             if not self.services_initialized:
@@ -1394,13 +1434,22 @@ class MarketBot:
             photo_bytes_list = [photo['bytes'] for photo in uploaded_photos]
 
             if self.gemini_service:
-                recognition_results = await self.gemini_service.recognize_multiple_products(photo_bytes_list)
+                try:
+                    recognition_results = await self.gemini_service.recognize_multiple_products(photo_bytes_list)
+                except Exception as e:
+                    logger.error(f"Error in gemini service: {e}")
+                    # Fallback - используем заглушки
+                    for i, photo in enumerate(uploaded_photos):
+                        recognition_results.append({
+                            'short_description': f'Товар {i + 1}',
+                            'full_description': f'Ошибка распознавания. Пожалуйста, введите описание вручную.\n\nТехническая информация: {str(e)[:100]}'
+                        })
             else:
                 # Fallback - используем заглушки
                 for i, photo in enumerate(uploaded_photos):
                     recognition_results.append({
                         'short_description': f'Товар {i + 1}',
-                        'full_description': 'Распознавание временно недоступно. Введите описание вручную.'
+                        'full_description': 'Распознавание временно недоступно. Введите описание вручную.\n\nПричина: Gemini API не настроен. Добавьте API ключ в .env файл.'
                     })
 
             context.user_data['recognition_results'] = recognition_results
