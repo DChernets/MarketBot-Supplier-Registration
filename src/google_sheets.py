@@ -39,11 +39,11 @@ class GoogleSheetsManager:
             "pavilion_number", "contact_phones"
         ]
 
-        # Заголовки для листа products
+        # Заголовки для листа products (соответствуют реальной структуре)
         products_headers = [
-            "product_id", "supplier_internal_id", "location_id",
-            "short_description", "full_description", "quantity",
-            "image_urls", "created_at"
+            "product_id", "supplier_id", "location_id",
+            "name", "description", "photo_urls", "quantity", "created_at",
+            "updated_at", "recognition_data"
         ]
 
         # Проверяем и добавляем заголовки если нужно
@@ -193,11 +193,27 @@ class GoogleSheetsManager:
         from datetime import datetime
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # Убеждаемся что quantity это число
+        try:
+            quantity = int(quantity)
+        except (ValueError, TypeError):
+            quantity = 1
+
+        # Собираем строку в соответствии с реальной структурой таблицы
         row = [
-            product_id, supplier_internal_id, location_id,
-            short_description, full_description, quantity,
-            image_urls, now
+            str(product_id),                                   # product_id
+            str(supplier_internal_id),                        # supplier_id
+            str(location_id),                                 # location_id
+            str(short_description),                           # name
+            str(full_description),                            # description
+            str(image_urls) if image_urls else "",            # photo_urls
+            quantity,                                         # quantity (число)
+            now,                                              # created_at
+            "",                                               # updated_at
+            ""                                                # recognition_data
         ]
+
+        
         self.products_sheet.append_row(row)
         return product_id
 
@@ -206,12 +222,15 @@ class GoogleSheetsManager:
         try:
             all_records = self.products_sheet.get_all_records()
             products = []
+
             for record in all_records:
-                supplier_id_field = record.get("supplier_internal_id")
+                supplier_id_field = record.get("supplier_id")
                 if supplier_id_field == supplier_internal_id or str(supplier_id_field) == str(supplier_internal_id):
                     products.append(record)
+
             return products
-        except:
+        except Exception as e:
+            logger.error(f"Error getting products: {e}")
             return []
 
     def get_product_by_id(self, product_id):

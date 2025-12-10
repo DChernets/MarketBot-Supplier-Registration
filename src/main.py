@@ -1172,7 +1172,7 @@ class MarketBot:
 
             keyboard = []
             for i, product in enumerate(products, 1):
-                short_desc = product.get('short_description', 'Без названия')
+                short_desc = product.get('name', 'Без названия')  # Изменено с short_description на name
                 quantity = product.get('quantity', 'Не указано')
                 created_at = product.get('created_at', '')
 
