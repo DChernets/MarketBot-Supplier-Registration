@@ -1,6 +1,8 @@
 import logging
 import uuid
 import asyncio
+import requests
+from io import BytesIO
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler
 from src.config import TELEGRAM_BOT_TOKEN, DEBUG
@@ -33,6 +35,137 @@ class MarketBot:
         self.image_storage_service = None
         self.services_initialized = False
         self.setup_handlers()
+
+    async def send_photo_from_telegram_url(self, chat_id: int, photo_url: str, caption: str = None, reply_markup=None):
+        """Скачать фото с Telegram URL и отправить его как файл"""
+        try:
+            logger.info(f"Downloading photo from: {photo_url}")
+
+            # Скачиваем фото с использованием токена бота для аутентификации
+            headers = {}
+            response = requests.get(photo_url, headers=headers, timeout=10)
+
+            if response.status_code == 200:
+                logger.info(f"Photo downloaded successfully, size: {len(response.content)} bytes")
+
+                # Создаем файл из скачанных данных
+                photo_file = BytesIO(response.content)
+                photo_file.name = 'product_photo.jpg'  # Устанавливаем имя файла
+
+                # Отправляем фото в Telegram
+                await self.application.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo_file,
+                    caption=caption,
+                    reply_markup=reply_markup
+                )
+                logger.info("Photo sent successfully")
+                return True
+            else:
+                logger.error(f"Failed to download photo, status code: {response.status_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error downloading/sending photo: {e}")
+            return False
+
+    def extract_product_name(self, description: str) -> str:
+        """Извлечь реальное название товара из описания"""
+        if not description or description.strip() == "":
+            return "Товар"
+
+        import re
+
+        # Сначала пытаемся извлечь из фразы "Тип товара:" (самый надежный способ)
+        type_match = re.search(r'- Тип товара:\s*([^-/]+)', description)
+        if type_match:
+            type_name = type_match.group(1).strip()
+            # Убираем лишние детали и разделители
+            type_name = re.split(r'[/|-]', type_name)[0].strip()
+            if type_name:
+                # Укорачиваем длинные названия
+                if len(type_name) > 8:  # Уменьшаем порог до 8 символов
+                    # Ищем основное слово (до первого пробела или предлога)
+                    main_word = re.split(r'[\s(]', type_name)[0].strip()
+                    if main_word and len(main_word) > 2:
+                        return main_word
+                return type_name
+
+        # Если не нашли "Тип товара:", ищем по ключевым словам
+        keywords = [
+            ("Бокал", "Бокал"),
+            ("Термокружка", "Термокружка"),
+            ("термостакан", "Термокружка"),
+            ("Футболка", "Футболка"),
+            ("Джинсы", "Джинсы"),
+            ("Кроссовки", "Кроссовки"),
+            ("Телефон", "Смартфон"),
+            ("Смартфон", "Смартфон"),
+            ("Наушники", "Наушники"),
+            ("Шапочка", "Шапочка"),
+            ("Шапка", "Шапочка"),
+            ("Сахарница", "Сахарница"),
+            ("Чайник", "Чайник"),
+            ("Кружка", "Кружка"),
+            ("Кошелек", "Кошелек"),
+            ("Сумка", "Сумка"),
+            ("Рюкзак", "Рюкзак"),
+            ("Куртка", "Куртка"),
+            ("Ботинки", "Ботинки"),
+            ("Мышка", "Компьютерная мышка"),
+            ("Клавиатура", "Клавиатура"),
+            ("Монитор", "Монитор"),
+            ("Планшет", "Планшет"),
+            ("Часы", "Часы"),
+            ("Очки", "Очки"),
+            ("Ручка", "Ручка"),
+            ("Блокнот", "Блокнот"),
+            ("Книга", "Книга"),
+            ("Тарелка", "Тарелка"),
+            ("Вилка", "Вилка"),
+            ("Ложка", "Ложка"),
+            ("Нож", "Нож"),
+        ]
+
+        for keyword, result in keywords:
+            if keyword.lower() in description.lower():
+                return result
+
+        # Если ничего не нашли, пробуем извлечь первое слово после маркера
+        first_word_match = re.search(r'-\s*([А-Яа-яA-Za-z]+)', description)
+        if first_word_match:
+            first_word = first_word_match.group(1).strip()
+            if len(first_word) > 2:  # Исключаем слишком короткие слова
+                return first_word
+
+        return "Товар"
+
+    def extract_short_description(self, description: str, max_length: int = 100) -> str:
+        """Извлечь краткое описание в 1 предложение"""
+        if not description or description.strip() == "":
+            return "Описание отсутствует"
+
+        # Ищем первое осмысленное предложение
+        import re
+
+        # Убираем маркеры списка и лишние пробелы
+        clean_desc = re.sub(r'^-\s*', '', description, flags=re.MULTILINE)
+        clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
+
+        # Разбиваем на предложения и берем первое
+        sentences = re.split(r'[.!?]', clean_desc)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) > 10:  # Пропускаем слишком короткие
+                # Обрезаем если слишком длинное
+                if len(sentence) > max_length:
+                    sentence = sentence[:max_length].rsplit(' ', 1)[0] + '...'
+                return sentence
+
+        # Если не нашли предложений, берем первые символы
+        if len(clean_desc) > max_length:
+            clean_desc = clean_desc[:max_length].rsplit(' ', 1)[0] + '...'
+        return clean_desc if clean_desc else "Описание отсутствует"
 
     def setup_handlers(self):
         """Настройка обработчиков команд"""
@@ -219,6 +352,9 @@ class MarketBot:
         elif query.data == 'my_products':
             logger.info(f"handle_callback: calling show_my_products")
             await self.show_my_products(update, context)
+        elif query.data == 'test_my_products':
+            logger.info(f"handle_callback: calling show_my_products for TEST")
+            await self.show_my_products(update, context)
         elif query.data == 'confirm_photo_recognition':
             logger.info(f"handle_callback: calling confirm_photo_recognition")
             await self.confirm_photo_recognition(update, context)
@@ -238,8 +374,8 @@ class MarketBot:
             logger.info(f"handle_callback: calling delete_product")
             await self.delete_product(update, context)
         elif query.data == 'back_to_profile':
-            logger.info(f"handle_callback: calling profile_command")
-            await self.profile_command(update, context)
+            logger.info(f"handle_callback: calling back_to_profile")
+            await self.back_to_profile(update, context)
         elif query.data == 'process_photos_ready':
             logger.info(f"handle_callback: calling process_photo_recognition")
             await self.process_photo_recognition(update, context)
@@ -508,6 +644,11 @@ class MarketBot:
     async def profile_command(self, update: Update, context):
         """Показать профиль пользователя"""
         try:
+            # Проверяем, что update.message не равен None
+            if not update.message:
+                logger.error("Error in profile_command: update.message is None")
+                return
+
             if not self.sheets_manager:
                 self.sheets_manager = GoogleSheetsManager()
 
@@ -537,11 +678,16 @@ class MarketBot:
 
                 locations = all_locations
 
+                # Экранируем специальные символы Markdown
+                contact_name = str(supplier['contact_name']).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                telegram_username = str(supplier['telegram_username']).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                internal_id = str(supplier['internal_id'])
+
                 profile_text = (
                     f"📋 *ВАШ ПРОФИЛЬ*\n\n"
-                    f"👤 Имя: {supplier['contact_name']}\n"
-                    f"📱 Telegram: @{supplier['telegram_username']}\n"
-                    f"🆔 ID: {supplier['internal_id']}\n\n"
+                    f"👤 Имя: {contact_name}\n"
+                    f"📱 Telegram: @{telegram_username}\n"
+                    f"🆔 ID: {internal_id}\n\n"
                     f"🏪 *ВАШИ ТОЧКИ ПРОДАЖИ:*\n"
                 )
 
@@ -549,16 +695,21 @@ class MarketBot:
                 keyboard = []
 
                 for i, location in enumerate(locations, 1):
+                    # Экранируем специальные символы в данных локации
+                    market_name = str(location['market_name']).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                    pavilion_number = str(location['pavilion_number']).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                    contact_phones = str(location['contact_phones']).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+
                     profile_text += (
                         f"\n*Точка {i}:*\n"
-                        f"🏬 Рынок: {location['market_name']}\n"
-                        f"🏢 Павильон: {location['pavilion_number']}\n"
-                        f"📞 Телефоны: {location['contact_phones']}\n"
+                        f"🏬 Рынок: {market_name}\n"
+                        f"🏢 Павильон: {pavilion_number}\n"
+                        f"📞 Телефоны: {contact_phones}\n"
                     )
 
                     # Добавляем кнопки управления для каждой локации
                     location_buttons = [
-                        InlineKeyboardButton(f"✏️ Редакровать {i}", callback_data=f"edit_location_{location['location_id']}"),
+                        InlineKeyboardButton(f"✏️ Редактировать {i}", callback_data=f"edit_location_{location['location_id']}"),
                         InlineKeyboardButton(f"🗑️ Удалить {i}", callback_data=f"delete_location_{location['location_id']}")
                     ]
                     keyboard.append(location_buttons)
@@ -581,7 +732,8 @@ class MarketBot:
 
         except Exception as e:
             logger.error(f"Error in profile_command: {e}")
-            await update.message.reply_text("Произошла ошибка при загрузке профиля. Попробуйте позже.")
+            if update.message:
+                await update.message.reply_text("Произошла ошибка при загрузке профиля. Попробуйте позже.")
 
     async def edit_location_callback(self, update: Update, context):
         """Обработка редактирования локации"""
@@ -1170,7 +1322,7 @@ class MarketBot:
             logger.error(f"Error in start_photo_recognition: {e}")
 
     async def show_my_products(self, update: Update, context):
-        """Показать мои товары"""
+        """Показать мои товары с фото"""
         try:
             query = update.callback_query
             await query.answer()
@@ -1179,66 +1331,174 @@ class MarketBot:
                 self.sheets_manager = GoogleSheetsManager()
 
             user_id = query.from_user.id
+            logger.info(f"show_my_products called for user_id: {user_id}")
+
             supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
+            logger.info(f"Supplier found: {supplier is not None}")
 
             if not supplier:
+                logger.warning(f"Supplier not found for user_id: {user_id}")
                 await query.edit_message_text(
                     "❌ Вы не зарегистрированы. Используйте /start для регистрации."
                 )
                 return
 
             supplier_id = supplier['internal_id']
+            logger.info(f"Supplier ID: {supplier_id}")
+
             products = self.sheets_manager.get_products_by_supplier_id(supplier_id)
+            logger.info(f"Products returned: {products}, type: {type(products)}, length: {len(products) if products else 'N/A'}")
 
             if not products:
+                logger.info(f"No products found for supplier {supplier_id}")
                 await query.edit_message_text(
-                    "📦 *Мои товары*\n\n"
+                    "📦 Мои товары\n\n"
                     "У вас пока нет сохраненных товаров.\n\n"
-                    "Используйте кнопку 📸 ФОТО для добавления товаров.",
-                    parse_mode='Markdown'
+                    "Используйте кнопку 📸 ФОТО для добавления товаров."
                 )
                 return
 
-            # Формируем сообщение с товарами
-            message = "📦 *Мои товары*\n\n"
+            # Сначала редактируем текущее сообщение на заголовок
+            await query.edit_message_text(
+                f"📦 Мои товары ({len(products)} шт.)\n\n"
+                "Загружаю изображения...",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад", callback_data="back_to_profile")
+                ]])
+            )
 
+            # Отправляем каждый товар отдельным сообщением с фото
             keyboard = []
             for i, product in enumerate(products, 1):
-                short_desc = product.get('name', 'Без названия')  # Изменено с short_description на name
-                quantity = product.get('quantity', 'Не указано')
-                created_at = product.get('created_at', '')
-                photo_url = product.get('photo_urls', '')
+                try:
+                    # Безопасное получение данных с обработкой ошибок
+                    product_id = str(product.get('product_id', f'unknown_{i}'))
+                    raw_name = str(product.get('name', 'Без названия'))
+                    description = str(product.get('description', ''))
 
-                # Добавляем информацию о товаре
-                message += f"🏷️ *Товар {i}*: {short_desc}\n"
-                message += f"📊 Количество: {quantity}\n"
-                if photo_url and photo_url.strip():
-                    message += f"🖼️ Фото: {photo_url}\n"
-                if created_at:
-                    message += f"📅 Добавлен: {created_at}\n"
-                message += "\n"
+                    # Извлекаем реальное название и краткое описание
+                    product_name = self.extract_product_name(description)
+                    short_desc = self.extract_short_description(description, 80)
 
-                # Добавляем кнопки управления
-                product_buttons = [
-                    InlineKeyboardButton(f"✏️ Редактировать {i}", callback_data=f"edit_product_{product['product_id']}"),
-                    InlineKeyboardButton(f"🗑️ Удалить {i}", callback_data=f"delete_product_{product['product_id']}")
-                ]
-                keyboard.append(product_buttons)
+                    # Безопасная обработка quantity
+                    quantity = product.get('quantity', '0')
+                    if quantity is None or quantity == '':
+                        quantity_str = '0'
+                    else:
+                        quantity_str = str(quantity)
 
-            # Добавляем кнопку возврата
-            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_profile")])
+                    created_at = str(product.get('created_at', ''))
+                    photo_url = product.get('photo_urls', '')
 
-            reply_markup = InlineKeyboardMarkup(keyboard)
+                    # Формируем описание товара с новой структурой
+                    caption = f"🏷️ {product_name}\n"
+                    caption += f"📝 {short_desc}\n"
+                    caption += f"🆔 ID: {product_id}\n"
+                    caption += f"📊 Количество: {quantity_str}\n"
+                    if created_at and created_at.strip():
+                        caption += f"📅 Добавлен: {created_at}\n"
 
-            await query.edit_message_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
+                    # Кнопки управления для товара
+                    product_buttons = [
+                        InlineKeyboardButton(f"✏️ Редактировать", callback_data=f"edit_product_{product_id}"),
+                        InlineKeyboardButton(f"🗑️ Удалить", callback_data=f"delete_product_{product_id}")
+                    ]
+
+                    try:
+                        # Проверяем и отправляем фото если есть
+                        if photo_url:
+                            photo_url_str = str(photo_url) if photo_url else ""
+                            if photo_url_str.strip() and not photo_url_str.isdigit():
+                                logger.info(f"Sending photo for product {product_id}: {photo_url_str}")
+
+                                # Создаем клавиатуру для этого товара
+                                product_markup = InlineKeyboardMarkup([product_buttons])
+
+                                # Отправляем фото с описанием через нашу функцию
+                                success = await self.send_photo_from_telegram_url(
+                                    chat_id=user_id,
+                                    photo_url=photo_url_str,
+                                    caption=caption,
+                                    reply_markup=product_markup
+                                )
+
+                                if success:
+                                    logger.info(f"Photo sent successfully for product {product_id}")
+                                else:
+                                    # Если фото не отправилось, отправляем текст с ссылкой
+                                    logger.warning(f"Failed to send photo for product {product_id}")
+                                    caption += f"\n🖼️ Фото: {photo_url_str}"
+                                    await context.bot.send_message(
+                                        chat_id=user_id,
+                                        text=caption,
+                                        reply_markup=product_markup
+                                    )
+                            else:
+                                # Если нет фото URL, отправляем только текст
+                                product_markup = InlineKeyboardMarkup([product_buttons])
+                                await context.bot.send_message(
+                                    chat_id=user_id,
+                                    text=caption,
+                                    reply_markup=product_markup
+                                )
+                        else:
+                            # Если нет фото, отправляем только текст
+                            product_markup = InlineKeyboardMarkup([product_buttons])
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=caption,
+                                reply_markup=product_markup
+                            )
+
+                    except Exception as send_error:
+                        logger.error(f"Error sending product {i}: {send_error}")
+                        # В случае ошибки отправляем простое текстовое сообщение
+                        error_text = f"❌ Товар {i}: {short_desc}\nОшибка при отображении"
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=error_text
+                        )
+
+                except Exception as product_error:
+                    logger.error(f"Error processing product {i}: {product_error}")
+                    # Отправляем сообщение об ошибке для этого товара
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"❌ Товар {i}: Ошибка при обработке данных"
+                    )
+
+            # Отправляем финальное сообщение с общей статистикой
+            summary_message = f"✅ Все товары загружены\n\n"
+            summary_message += f"📊 Всего товаров: {len(products)}\n"
+            summary_message += f"Используйте кнопки управления под каждым товаром"
+
+            # Кнопка возврата в конце
+            final_keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад в профиль", callback_data="back_to_profile")
+            ]])
+
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=summary_message,
+                reply_markup=final_keyboard
             )
 
         except Exception as e:
             logger.error(f"Error in show_my_products: {e}")
-            await update.callback_query.edit_message_text("❌ Ошибка при загрузке товаров")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+            try:
+                if hasattr(update, 'callback_query') and update.callback_query:
+                    await update.callback_query.edit_message_text(
+                        "❌ Ошибка при загрузке товаров. Попробуйте еще раз позже."
+                    )
+                else:
+                    await update.message.reply_text(
+                        "❌ Ошибка при загрузке товаров. Попробуйте еще раз позже."
+                    )
+            except Exception as fallback_error:
+                logger.error(f"Error in fallback message: {fallback_error}")
 
     async def confirm_photo_recognition(self, update: Update, context):
         """Подтвердить результаты распознавания"""
@@ -1367,14 +1627,13 @@ class MarketBot:
             logger.error(f"Error in select_location_for_product: {e}")
 
     async def edit_product(self, update: Update, context):
-        """Редактировать товар"""
+        """Редактировать товар с отображением фото"""
         try:
             query = update.callback_query
             await query.answer()
 
             product_id = query.data.replace('edit_product_', '')
 
-            # Для простоты пока просто показываем информацию о товаре
             if not self.sheets_manager:
                 self.sheets_manager = GoogleSheetsManager()
 
@@ -1383,23 +1642,74 @@ class MarketBot:
                 await query.edit_message_text("❌ Товар не найден")
                 return
 
-            message = (
-                f"📦 *Информация о товаре*\n\n"
-                f"🏷️ Название: {product.get('short_description', 'Без названия')}\n"
-                f"📝 Описание: {product.get('full_description', 'Нет описания')}\n"
-                f"📊 Количество: {product.get('quantity', 'Не указано')}\n"
-                f"📅 Добавлен: {product.get('created_at', 'Неизвестно')}\n\n"
-                "*Функция редактирования будет доступна в следующей версии.*"
-            )
+            user_id = query.from_user.id
 
-            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="my_products")]]
+            # Извлекаем реальное название и краткое описание
+            description = str(product.get('description', ''))
+            product_name = self.extract_product_name(description)
+            short_desc = self.extract_short_description(description, 120)
+
+            # Формируем описание товара с новой структурой
+            caption = f"📦 Информация о товаре\n\n"
+            caption += f"🏷️ {product_name}\n"
+            caption += f"📝 {short_desc}\n"
+            caption += f"🆔 ID: {product_id}\n"
+            caption += f"📊 Количество: {product.get('quantity', 'Не указано')}\n"
+
+            created_at = product.get('created_at', '')
+            if created_at and created_at.strip():
+                caption += f"📅 Добавлен: {created_at}\n"
+
+            caption += f"\n📝 Функция редактирования будет доступна в следующей версии."
+
+            # Кнопка возврата
+            keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            await query.edit_message_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
+            # Проверяем наличие фото
+            photo_url = product.get('photo_urls', '')
+
+            if photo_url:
+                photo_url_str = str(photo_url) if photo_url else ""
+                if photo_url_str.strip() and not photo_url_str.isdigit():
+                    logger.info(f"Sending photo for edit product {product_id}: {photo_url_str}")
+
+                    # Сначала редактируем текущее сообщение на "Загружаю..."
+                    await query.edit_message_text(
+                        "📦 Информация о товаре\n\nЗагружаю изображение...",
+                        reply_markup=reply_markup
+                    )
+
+                    # Отправляем новое сообщение с фото через нашу функцию
+                    success = await self.send_photo_from_telegram_url(
+                        chat_id=user_id,
+                        photo_url=photo_url_str,
+                        caption=caption,
+                        reply_markup=reply_markup
+                    )
+
+                    if success:
+                        logger.info(f"Photo sent successfully for edit product {product_id}")
+                    else:
+                        # Если фото не отправилось, отправляем текст со ссылкой
+                        logger.warning(f"Failed to send photo for edit product {product_id}")
+                        caption += f"\n🖼️ Фото: {photo_url_str}"
+                        await query.edit_message_text(
+                            caption,
+                            reply_markup=reply_markup
+                        )
+                else:
+                    # Если нет фото URL, отправляем только текст
+                    await query.edit_message_text(
+                        caption,
+                        reply_markup=reply_markup
+                    )
+            else:
+                # Если нет фото, отправляем только текст
+                await query.edit_message_text(
+                    caption,
+                    reply_markup=reply_markup
+                )
 
         except Exception as e:
             logger.error(f"Error in edit_product: {e}")
@@ -1507,6 +1817,85 @@ class MarketBot:
         except Exception as e:
             logger.error(f"Error in process_photo_recognition: {e}")
             await update.message.reply_text("❌ Ошибка при распознавании. Попробуйте позже.")
+
+    async def back_to_profile(self, update: Update, context):
+        """Вернуться в профиль из callback"""
+        try:
+            if not self.sheets_manager:
+                self.sheets_manager = GoogleSheetsManager()
+
+            query = update.callback_query
+            user = query.from_user
+            telegram_user_id = user.id
+
+            supplier = self.sheets_manager.get_supplier_by_telegram_id(telegram_user_id)
+
+            if supplier:
+                # Формируем сообщение профиля
+                contact_name = str(supplier.get('contact_name', 'Не указано')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                market_name = str(supplier.get('market_name', 'Не указано')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                telegram_username = str(supplier.get('telegram_username', user.username or 'Нет username')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+
+                # Получаем количество товаров
+                supplier_id = supplier['internal_id']
+                products = self.sheets_manager.get_products_by_supplier_id(supplier_id)
+                product_count = len(products) if products else 0
+
+                message = f"👤 *Личный кабинет поставщика*\n\n"
+                message += f"📛 *Имя:* {contact_name}\n"
+                message += f"🏪 *Рынок:* {market_name}\n"
+                message += f"📱 *Telegram:* @{telegram_username}\n"
+                message += f"🆔 *ID:* {telegram_user_id}\n"
+                message += f"📦 *Товаров:* {product_count} шт.\n\n"
+
+                # Получаем все локации поставщика
+                locations = self.sheets_manager.get_locations_by_supplier_id(supplier_id)
+                if locations:
+                    message += "📍 *Ваши локации:*\n"
+                    for i, loc in enumerate(locations[:3], 1):
+                        market = str(loc.get('market_name', 'Неизвестный рынок')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                        pavilion = str(loc.get('pavilion_number', 'Без номера')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                        phones = str(loc.get('contact_phones', '')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                        message += f"  {i}. {market}, пав. {pavilion}"
+                        if phones:
+                            message += f" 📞 {phones}"
+                        message += "\n"
+                    if len(locations) > 3:
+                        message += f"  ... и еще {len(locations) - 3} локаций\n"
+
+                # Создаем клавиатуру с кнопками управления
+                keyboard = [
+                    [InlineKeyboardButton("📦 МОИ ТОВАРЫ", callback_data="my_products")],
+                    [InlineKeyboardButton("📍 МОИ ЛОКАЦИИ", callback_data="my_locations")],
+                    [InlineKeyboardButton("📸 ФОТО", callback_data="photo_recognition")]
+                ]
+
+                # Добавляем кнопку регистрации если товаров еще нет
+                if product_count == 0:
+                    keyboard.insert(1, [InlineKeyboardButton("➕ ДОБАВИТЬ ТОВАР", callback_data="photo_recognition")])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await query.edit_message_text(
+                    message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+            else:
+                await query.edit_message_text(
+                    "❌ Профиль не найден. Используйте /start для регистрации."
+                )
+
+        except Exception as e:
+            logger.error(f"Error in back_to_profile: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+            # Fallback сообщение
+            await update.callback_query.edit_message_text(
+                "❌ Ошибка при загрузке профиля. Попробуйте команду /profile"
+            )
 
     async def cancel_photo_recognition(self, update: Update, context):
         """Отменить распознавание фото"""

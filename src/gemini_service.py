@@ -58,14 +58,15 @@ class GeminiService:
 
 Твоя задача - проанализировать изображение товара и предоставить описание в следующем формате:
 
-1. Краткое описание (1-2 слова): Название товара категории
+1. Краткое описание: [Конкретное название товара 1-2 слова, например: "Бокал", "Стакан", "Тарелка"]
 2. Полное описание: Подробное описание товара включая:
    - Тип товара
-   - Характеристики (размер, цвет,材质)
+   - Характеристики (размер, цвет, материал)
    - Упаковка
    - Примерное назначение
    - Любые другие важные детали
 
+ВАЖНО: В кратком описании указывай конкретное название товара, а не общее слово "Товар".
 Отвечай на русском языке. Быть точным и конкретным."""
 
     def prepare_image_for_gemini(self, image_bytes: bytes) -> Image.Image:
@@ -149,32 +150,92 @@ class GeminiService:
             # Разделяем ответ на краткое и полное описание
             lines = response_text.strip().split('\n')
 
-            short_description = "Товар"
+            short_description = "Распознанный товар"
             full_description = response_text.strip()
 
-            # Ищем краткое описание
-            for line in lines:
-                if "краткое описание" in line.lower() or "1." in line:
+            # Улучшенный поиск краткого описания
+            # Ищем сначала "1." или "Краткое описание"
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+
+                # Вариант 1: "1. Краткое описание: Название"
+                if line_stripped.startswith("1.") and "краткое описание" in line_stripped.lower():
                     parts = line.split(':', 1)
                     if len(parts) > 1:
                         short_description = parts[1].strip()
                         break
 
-            # Ищем полное описание
-            for line in lines:
-                if "полное описание" in line.lower() or "2." in line:
-                    parts = line.split(':', 1)
+                # Вариант 2: Просто "1. Бокал" или "Бокал для вина"
+                elif line_stripped.startswith("1."):
+                    parts = line.split('.', 1)
                     if len(parts) > 1:
-                        # Собираем полное описание из всех последующих строк
-                        desc_start = lines.index(line)
-                        full_description = ':'.join(parts[1:]).strip()
-                        if desc_start + 1 < len(lines):
-                            full_description += '\n' + '\n'.join(lines[desc_start + 1:])
+                        short_description = parts[1].strip()
                         break
 
+                # Вариант 3: "Краткое описание: Бокал"
+                elif "краткое описание" in line_stripped.lower():
+                    parts = line.split(':', 1)
+                    if len(parts) > 1:
+                        short_description = parts[1].strip()
+                        break
+
+            # Если краткое название не найдено, пробуем извлечь из полного описания
+            if short_description in ["Распознанный товар", "Товар"]:
+                # Ищем первое substantive слово/фразу в ответе
+                for line in lines:
+                    words = line.strip().split()
+                    for word in words:
+                        # Пропускаем маркеры и цифры
+                        if (len(word) > 2 and
+                            not word.isdigit() and
+                            word.lower() not in ['1.', '2.', 'краткое', 'описание', 'полное', 'тип', 'товара']):
+                            # Берем первые 1-2 слова как название
+                            short_description = word
+                            if len(words) > 1 and len(words[1]) > 2:
+                                short_description += ' ' + words[1]
+                            break
+                    if short_description not in ["Распознанный товар", "Товар"]:
+                        break
+
+            # Ищем полное описание
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+
+                # Вариант 1: "2. Полное описание: ..."
+                if line_stripped.startswith("2.") and "полное описание" in line_stripped.lower():
+                    parts = line.split(':', 1)
+                    if len(parts) > 1:
+                        full_description = parts[1].strip()
+                        if i + 1 < len(lines):
+                            full_description += '\n' + '\n'.join(lines[i + 1:])
+                        break
+
+                # Вариант 2: "Полное описание: ..."
+                elif "полное описание" in line_stripped.lower():
+                    parts = line.split(':', 1)
+                    if len(parts) > 1:
+                        full_description = parts[1].strip()
+                        if i + 1 < len(lines):
+                            full_description += '\n' + '\n'.join(lines[i + 1:])
+                        break
+
+            # Если полное описание не найдено, используем весь ответ
+            if full_description == response_text.strip() and len(lines) > 1:
+                # Пробуем исключить первую строку если это краткое описание
+                if lines[0].strip().startswith("1.") or "краткое описание" in lines[0].lower():
+                    full_description = '\n'.join(lines[1:]).strip()
+
             # Очищаем и форматируем
-            short_description = self._clean_text(short_description)[:50]  # Максимум 50 символов
-            full_description = self._clean_text(full_description)[:1000]  # Максимум 1000 символов
+            short_description = self._clean_text(short_description)
+            if len(short_description) > 50:
+                # Если название слишком длинное, обрезаем до первого пробела или до 30 символов
+                short_description = short_description[:47] + '...'
+
+            full_description = self._clean_text(full_description)
+            if len(full_description) > 1000:
+                full_description = full_description[:997] + '...'
+
+            logger.info(f"Распознано: {short_description[:30]}...")
 
             return {
                 "short_description": short_description,
