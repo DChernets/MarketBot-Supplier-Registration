@@ -352,6 +352,9 @@ class MarketBot:
         elif query.data == 'my_products':
             logger.info(f"handle_callback: calling show_my_products")
             await self.show_my_products(update, context)
+        elif query.data == 'my_locations':
+            logger.info(f"handle_callback: calling show_my_locations")
+            await self.show_my_locations(update, context)
         elif query.data == 'test_my_products':
             logger.info(f"handle_callback: calling show_my_products for TEST")
             await self.show_my_products(update, context)
@@ -1248,7 +1251,7 @@ class MarketBot:
             await update.message.reply_text("❌ Ошибка при загрузке фото")
 
     async def show_photo_confirmation(self, update: Update, context):
-        """Показать результаты распознавания фото"""
+        """Показать результаты распознавания фото с поддержкой новой JSON-структуры"""
         try:
             recognition_results = context.user_data.get('recognition_results', [])
 
@@ -1260,12 +1263,35 @@ class MarketBot:
             message = "🖼️ *Результаты распознавания:*\n\n"
 
             for i, result in enumerate(recognition_results, 1):
-                short_desc = result.get('short_description', 'Неизвестный товар')
-                full_desc = result.get('full_description', 'Нет описания')
+                # Проверяем, новая ли JSON-структура или старая
+                if 'название' in result and 'описание' in result:
+                    # Новая JSON-структура
+                    title = result.get('название', 'Неизвестный товар')
+                    description = result.get('описание', 'Нет описания')
 
-                message += f"📷 *Товар {i}*\n"
-                message += f"🏷️ *Кратко:* {short_desc}\n"
-                message += f"📝 *Подробно:* {full_desc[:200]}{'...' if len(full_desc) > 200 else ''}\n\n"
+                    # Собираем дополнительную информацию
+                    details = []
+                    production = result.get('производство', '')
+                    material = result.get('материал', '')
+                    if production and production != 'Не указано':
+                        details.append(f"🏭 {production}")
+                    if material and material != 'Не указано':
+                        details.append(f"🧪 {material}")
+
+                    message += f"📷 *Товар {i}: {title}*\n"
+                    message += f"📝 {description}\n"
+                    if details:
+                        message += f"🏷️ {' | '.join(details)}\n"
+                else:
+                    # Старая структура (обратная совместимость)
+                    short_desc = result.get('short_description', 'Неизвестный товар')
+                    full_desc = result.get('full_description', 'Нет описания')
+
+                    message += f"📷 *Товар {i}*\n"
+                    message += f"🏷️ *Кратко:* {short_desc}\n"
+                    message += f"📝 *Подробно:* {full_desc[:200]}{'...' if len(full_desc) > 200 else ''}\n"
+
+                message += "\n"
 
             # Создаем клавиатуру
             keyboard = [
@@ -1373,12 +1399,23 @@ class MarketBot:
                 try:
                     # Безопасное получение данных с обработкой ошибок
                     product_id = str(product.get('product_id', f'unknown_{i}'))
-                    raw_name = str(product.get('name', 'Без названия'))
-                    description = str(product.get('description', ''))
 
-                    # Извлекаем реальное название и краткое описание
-                    product_name = self.extract_product_name(description)
-                    short_desc = self.extract_short_description(description, 80)
+                    # Используем новые поля из Google Sheets
+                    product_name = str(product.get('название', product.get('name', 'Без названия')))
+                    description_field = str(product.get('описание', product.get('description', '')))
+
+                    # Если название пустое, пробуем извлечь из описания
+                    if product_name == 'Без названия' or not product_name.strip():
+                        product_name = self.extract_product_name(description_field)
+
+                    # Формируем краткое описание
+                    if description_field and description_field.strip():
+                        short_desc = description_field
+                        # Ограничиваем длину
+                        if len(short_desc) > 150:
+                            short_desc = short_desc[:147] + "..."
+                    else:
+                        short_desc = self.extract_short_description(description_field, 80)
 
                     # Безопасная обработка quantity
                     quantity = product.get('quantity', '0')
@@ -1948,7 +1985,7 @@ class MarketBot:
             await update.message.reply_text("❌ Ошибка при сохранении товаров")
 
     async def save_products(self, update: Update, context, quantities):
-        """Сохранить товары в базу данных"""
+        """Сохранить товары в базу данных с новой JSON-структурой"""
         try:
             if not self.sheets_manager:
                 self.sheets_manager = GoogleSheetsManager()
@@ -1968,6 +2005,10 @@ class MarketBot:
             for i, (result, quantity) in enumerate(zip(recognition_results, quantities)):
                 product_id = str(uuid.uuid4())
 
+                # Добавляем количество в данные товара
+                product_data = result.copy()
+                product_data['quantity'] = quantity
+
                 # Используем прямой URL из Telegram
                 image_urls = ""
                 try:
@@ -1980,14 +2021,12 @@ class MarketBot:
                 except Exception as e:
                     logger.warning(f"Failed to get Telegram URL for image: {e}")
 
-                # Сохраняем в Google Sheets
+                # Сохраняем в Google Sheets с новой структурой
                 success = self.sheets_manager.add_product(
                     product_id=product_id,
                     supplier_internal_id=supplier['internal_id'],
                     location_id=selected_location_id,
-                    short_description=result.get('short_description', 'Без названия'),
-                    full_description=result.get('full_description', 'Нет описания'),
-                    quantity=quantity,
+                    product_data=product_data,
                     image_urls=image_urls
                 )
 
@@ -2006,6 +2045,70 @@ class MarketBot:
         except Exception as e:
             logger.error(f"Error in save_products: {e}")
             await update.message.reply_text("❌ Ошибка при сохранении товаров")
+
+    async def show_my_locations(self, update: Update, context):
+        """Показать мои локации"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            if not self.sheets_manager:
+                self.sheets_manager = GoogleSheetsManager()
+
+            user_id = query.from_user.id
+            supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
+
+            if not supplier:
+                await query.edit_message_text(
+                    "❌ Вы не зарегистрированы. Используйте /start для регистрации."
+                )
+                return
+
+            supplier_id = supplier['internal_id']
+
+            # Получаем все локации этого поставщика
+            locations = self.sheets_manager.get_locations_by_supplier_id(supplier_id)
+
+            if not locations:
+                await query.edit_message_text(
+                    "📍 *Мои локации*\n\n"
+                    "У вас пока нет сохраненных локаций.\n\n"
+                    "Используйте кнопку ➕ ДОБАВИТЬ НОВУЮ ТОЧКУ для добавления.",
+                    parse_mode='Markdown'
+                )
+                return
+
+            # Формируем сообщение с локациями
+            message = f"📍 *Мои локации ({len(locations)} шт.):*\n\n"
+
+            for i, location in enumerate(locations, 1):
+                market_name = str(location.get('market_name', 'Неизвестный рынок')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                pavilion_number = str(location.get('pavilion_number', 'Без номера')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                contact_phones = str(location.get('contact_phones', '')).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+
+                message += f"*🏪 Локация {i}*\n"
+                message += f"🏬 Рынок: {market_name}\n"
+                message += f"🏢 Павильон: {pavilion_number}\n"
+                if contact_phones:
+                    message += f"📞 Телефоны: {contact_phones}\n"
+                message += "\n"
+
+            # Создаем клавиатуру с кнопками управления
+            keyboard = [
+                [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")],
+                [InlineKeyboardButton("⬅️ Назад в профиль", callback_data="back_to_profile")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in show_my_locations: {e}")
+            await update.callback_query.edit_message_text("❌ Ошибка при загрузке локаций")
 
     def run(self):
         """Запуск бота"""

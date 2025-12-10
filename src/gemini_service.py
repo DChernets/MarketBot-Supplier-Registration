@@ -56,18 +56,29 @@ class GeminiService:
         # Системный промпт для распознавания товаров
         self.system_prompt = """Ты - эксперт по распознаванию товаров для оптовых продаж на рынках.
 
-Твоя задача - проанализировать изображение товара и предоставить описание в следующем формате:
+Проанализируй изображение товара и верни JSON-объект со следующими полями:
+- название: Конкретное название товара (1-3 слова)
+- описание: Краткое описание товара (1 предложение)
+- производство: Страна производитель
+- материал: Основной материал товара
+- размеры: Габариты, объем или размеры
+- упаковка: Информация об упаковке товара
 
-1. Краткое описание: [Конкретное название товара 1-2 слова, например: "Бокал", "Стакан", "Тарелка"]
-2. Полное описание: Подробное описание товара включая:
-   - Тип товара
-   - Характеристики (размер, цвет, материал)
-   - Упаковка
-   - Примерное назначение
-   - Любые другие важные детали
+ВАЖНО:
+1. Верни ТОЛЬКО JSON без дополнительного текста
+2. Все поля обязательны, используй "Не указано" если информация не определена
+3. Название должно быть конкретным, а не общим словом "Товар"
+4. Отвечай на русском языке
 
-ВАЖНО: В кратком описании указывай конкретное название товара, а не общее слово "Товар".
-Отвечай на русском языке. Быть точным и конкретным."""
+Пример формата:
+{
+  "название": "Бокал для вина",
+  "описание": "Стеклянный бокал на высокой ножке для красного вина",
+  "производство": "Китай",
+  "материал": "Стекло",
+  "размеры": "высота 18см, объем 250мл",
+  "упаковка": "коробка по 12 штук"
+}"""
 
     def prepare_image_for_gemini(self, image_bytes: bytes) -> Image.Image:
         """Подготовка изображения для Gemini API"""
@@ -98,7 +109,7 @@ class GeminiService:
             image = self.prepare_image_for_gemini(image_bytes)
 
             # Создаем промпт
-            prompt = f"{self.system_prompt}\n\nПроанализируй это изображение и предоставь описание товара."
+            prompt = f"{self.system_prompt}\n\nПроанализируй это изображение и верни JSON с описанием товара."
 
             # Генерируем ответ с повторными попытками
             max_retries = 3
@@ -118,7 +129,7 @@ class GeminiService:
                     )
 
                     if response.text:
-                        result = self._parse_response(response.text)
+                        result = self._parse_json_response(response.text)
                         logger.info("Товар успешно распознан")
                         return result
                     else:
@@ -140,113 +151,100 @@ class GeminiService:
             logger.error(f"Ошибка распознавания товара: {e}")
             # Возвращаем результат по умолчанию
             return {
-                "short_description": "Неизвестный товар",
-                "full_description": f"Не удалось распознать товар: {str(e)}"
+                'название': 'Неизвестный товар',
+                'описание': f'Не удалось распознать товар: {str(e)}',
+                'производство': 'Не указано',
+                'материал': 'Не указано',
+                'размеры': 'Не указано',
+                'упаковка': 'Не указано'
             }
 
-    def _parse_response(self, response_text: str) -> Dict[str, str]:
-        """Парсинг ответа от Gemini"""
+    def _parse_json_response(self, response_text: str) -> Dict[str, str]:
+        """Парсинг JSON-ответа от Gemini"""
+        import json
+
         try:
-            # Разделяем ответ на краткое и полное описание
-            lines = response_text.strip().split('\n')
+            logger.info(f"Получен ответ: {response_text[:200]}...")
 
-            short_description = "Распознанный товар"
-            full_description = response_text.strip()
+            # Очищаем текст от возможных проблемных символов и лишнего текста
+            cleaned_text = response_text.strip()
 
-            # Улучшенный поиск краткого описания
-            # Ищем сначала "1." или "Краткое описание"
-            for i, line in enumerate(lines):
-                line_stripped = line.strip()
+            # Ищем JSON в тексте (если Gemini вернул с дополнительным текстом)
+            start_idx = cleaned_text.find('{')
+            end_idx = cleaned_text.rfind('}')
 
-                # Вариант 1: "1. Краткое описание: Название"
-                if line_stripped.startswith("1.") and "краткое описание" in line_stripped.lower():
-                    parts = line.split(':', 1)
-                    if len(parts) > 1:
-                        short_description = parts[1].strip()
-                        break
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                json_str = cleaned_text[start_idx:end_idx + 1]
+                logger.info(f"Извлеченный JSON: {json_str[:100]}...")
+            else:
+                # Если не нашли JSON, пробуем обработать весь текст
+                json_str = cleaned_text
+                logger.warning(f"Не найдено JSON-разделение, обрабатываем весь текст")
 
-                # Вариант 2: Просто "1. Бокал" или "Бокал для вина"
-                elif line_stripped.startswith("1."):
-                    parts = line.split('.', 1)
-                    if len(parts) > 1:
-                        short_description = parts[1].strip()
-                        break
+            # Парсим JSON
+            data = json.loads(json_str)
 
-                # Вариант 3: "Краткое описание: Бокал"
-                elif "краткое описание" in line_stripped.lower():
-                    parts = line.split(':', 1)
-                    if len(parts) > 1:
-                        short_description = parts[1].strip()
-                        break
+            # Валидация обязательных полей
+            required_fields = ['название', 'описание', 'производство', 'материал', 'размеры', 'упаковка']
+            result = {}
 
-            # Если краткое название не найдено, пробуем извлечь из полного описания
-            if short_description in ["Распознанный товар", "Товар"]:
-                # Ищем первое substantive слово/фразу в ответе
-                for line in lines:
-                    words = line.strip().split()
-                    for word in words:
-                        # Пропускаем маркеры и цифры
-                        if (len(word) > 2 and
-                            not word.isdigit() and
-                            word.lower() not in ['1.', '2.', 'краткое', 'описание', 'полное', 'тип', 'товара']):
-                            # Берем первые 1-2 слова как название
-                            short_description = word
-                            if len(words) > 1 and len(words[1]) > 2:
-                                short_description += ' ' + words[1]
-                            break
-                    if short_description not in ["Распознанный товар", "Товар"]:
-                        break
+            for field in required_fields:
+                value = data.get(field, 'Не указано')
+                if value is None or value == '':
+                    value = 'Не указано'
+                result[field] = str(value).strip()
 
-            # Ищем полное описание
-            for i, line in enumerate(lines):
-                line_stripped = line.strip()
+            # Логирование распознанного товара
+            logger.info(f"Распознано: {result['название']} ({result['производство']}, {result['материал']})")
 
-                # Вариант 1: "2. Полное описание: ..."
-                if line_stripped.startswith("2.") and "полное описание" in line_stripped.lower():
-                    parts = line.split(':', 1)
-                    if len(parts) > 1:
-                        full_description = parts[1].strip()
-                        if i + 1 < len(lines):
-                            full_description += '\n' + '\n'.join(lines[i + 1:])
-                        break
+            return result
 
-                # Вариант 2: "Полное описание: ..."
-                elif "полное описание" in line_stripped.lower():
-                    parts = line.split(':', 1)
-                    if len(parts) > 1:
-                        full_description = parts[1].strip()
-                        if i + 1 < len(lines):
-                            full_description += '\n' + '\n'.join(lines[i + 1:])
-                        break
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка декодирования JSON: {e}")
+            logger.error(f"Текст ответа: {response_text[:500]}...")
 
-            # Если полное описание не найдено, используем весь ответ
-            if full_description == response_text.strip() and len(lines) > 1:
-                # Пробуем исключить первую строку если это краткое описание
-                if lines[0].strip().startswith("1.") or "краткое описание" in lines[0].lower():
-                    full_description = '\n'.join(lines[1:]).strip()
+            # Fallback: пробуем извлечь базовую информацию
+            return self._fallback_parse(response_text)
 
-            # Очищаем и форматируем
-            short_description = self._clean_text(short_description)
-            if len(short_description) > 50:
-                # Если название слишком длинное, обрезаем до первого пробела или до 30 символов
-                short_description = short_description[:47] + '...'
+        except Exception as e:
+            logger.error(f"Ошибка парсинга JSON-ответа: {e}")
+            logger.error(f"Текст ответа: {response_text[:500]}...")
 
-            full_description = self._clean_text(full_description)
-            if len(full_description) > 1000:
-                full_description = full_description[:997] + '...'
+            # Fallback: пробуем извлечь базовую информацию
+            return self._fallback_parse(response_text)
 
-            logger.info(f"Распознано: {short_description[:30]}...")
+    def _fallback_parse(self, response_text: str) -> Dict[str, str]:
+        """Fallback-парсер на случай, если JSON не удалось распознать"""
+        try:
+            # Ищем название товара (первое substantive слово)
+            words = response_text.replace('\n', ' ').split()
+            title = "Товар"
+
+            for word in words:
+                word = word.strip('.,!?:;()[]{}"\'')
+                if (len(word) > 2 and
+                    word.lower() not in ['для', 'из', 'с', 'на', 'и', 'или', 'не', 'по', 'под', 'при', 'над', 'без']):
+                    title = word
+                    break
 
             return {
-                "short_description": short_description,
-                "full_description": full_description
+                'название': title,
+                'описание': response_text[:200] + '...' if len(response_text) > 200 else response_text,
+                'производство': 'Не указано',
+                'материал': 'Не указано',
+                'размеры': 'Не указано',
+                'упаковка': 'Не указано'
             }
 
         except Exception as e:
-            logger.error(f"Ошибка парсинга ответа: {e}")
+            logger.error(f"Ошибка в fallback-парсере: {e}")
             return {
-                "short_description": "Распознанный товар",
-                "full_description": response_text[:500] if response_text else "Не удалось получить описание"
+                'название': 'Распознанный товар',
+                'описание': 'Не удалось распознать описание',
+                'производство': 'Не указано',
+                'материал': 'Не указано',
+                'размеры': 'Не указано',
+                'упаковка': 'Не указано'
             }
 
     def _clean_text(self, text: str) -> str:

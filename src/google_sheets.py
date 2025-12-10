@@ -39,11 +39,11 @@ class GoogleSheetsManager:
             "pavilion_number", "contact_phones"
         ]
 
-        # Заголовки для листа products (соответствуют реальной структуре)
+        # Заголовки для листа products (новая JSON-структура)
         products_headers = [
             "product_id", "supplier_id", "location_id",
-            "name", "description", "photo_urls", "quantity", "created_at",
-            "updated_at", "recognition_data"
+            "название", "описание", "производство", "материал", "размеры", "упаковка",
+            "photo_urls", "quantity", "created_at"
         ]
 
         # Проверяем и добавляем заголовки если нужно
@@ -187,9 +187,41 @@ class GoogleSheetsManager:
             traceback.print_exc()
             return False
 
-    def add_product(self, product_id, supplier_internal_id, location_id, short_description,
-                   full_description, quantity, image_urls):
-        """Добавление нового товара"""
+    def add_product(self, product_id, supplier_internal_id, location_id, product_data, image_urls):
+        """Добавление нового товара с новой JSON-структурой"""
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Убеждаемся что quantity это число
+        quantity = product_data.get('quantity', 1)
+        try:
+            quantity = int(quantity)
+        except (ValueError, TypeError):
+            quantity = 1
+
+        # Собираем строку в соответствии с новой структурой таблицы
+        row = [
+            str(product_id),                                   # product_id
+            str(supplier_internal_id),                        # supplier_id
+            str(location_id),                                 # location_id
+            str(product_data.get('название', 'Не указано')),           # название
+            str(product_data.get('описание', 'Не указано')),           # описание
+            str(product_data.get('производство', 'Не указано')),       # производство
+            str(product_data.get('материал', 'Не указано')),           # материал
+            str(product_data.get('размеры', 'Не указано')),             # размеры
+            str(product_data.get('упаковка', 'Не указано')),           # упаковка
+            str(image_urls) if image_urls else "",            # photo_urls
+            quantity,                                         # quantity (число)
+            now,                                              # created_at
+        ]
+
+
+        self.products_sheet.append_row(row)
+        return product_id
+
+    def add_product_legacy(self, product_id, supplier_internal_id, location_id, short_description,
+                          full_description, quantity, image_urls):
+        """Добавление нового товара (legacy-метод для обратной совместимости)"""
         from datetime import datetime
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -199,23 +231,17 @@ class GoogleSheetsManager:
         except (ValueError, TypeError):
             quantity = 1
 
-        # Собираем строку в соответствии с реальной структурой таблицы
-        row = [
-            str(product_id),                                   # product_id
-            str(supplier_internal_id),                        # supplier_id
-            str(location_id),                                 # location_id
-            str(short_description),                           # name
-            str(full_description),                            # description
-            str(image_urls) if image_urls else "",            # photo_urls
-            quantity,                                         # quantity (число)
-            now,                                              # created_at
-            "",                                               # updated_at
-            ""                                                # recognition_data
-        ]
+        # Конвертируем старые данные в новую структуру
+        product_data = {
+            'название': short_description,
+            'описание': full_description,
+            'производство': 'Не указано',
+            'материал': 'Не указано',
+            'размеры': 'Не указано',
+            'упаковка': 'Не указано'
+        }
 
-        
-        self.products_sheet.append_row(row)
-        return product_id
+        return self.add_product(product_id, supplier_internal_id, location_id, product_data, image_urls)
 
     def get_products_by_supplier_id(self, supplier_internal_id):
         """Получение всех товаров поставщика"""
@@ -280,4 +306,71 @@ class GoogleSheetsManager:
             return False
         except Exception as e:
             print(f"Error deleting product: {e}")
+            return False
+
+    def migrate_products_structure(self):
+        """Миграция существующих товаров на новую структуру"""
+        try:
+            print("Начинаем миграцию структуры товаров...")
+
+            # Получаем все существующие товары
+            all_records = self.products_sheet.get_all_records()
+
+            if not all_records:
+                print("Нет товаров для миграции")
+                return True
+
+            # Проверяем, есть ли старая структура (поля name, description)
+            first_record = all_records[0] if all_records else {}
+            has_old_structure = 'name' in first_record and 'description' in first_record
+
+            if not has_old_structure:
+                print("Структура уже новая, миграция не требуется")
+                return True
+
+            print(f"Найдено {len(all_records)} товаров для миграции")
+
+            migrated_count = 0
+            for i, record in enumerate(all_records):
+                try:
+                    row_num = i + 2  # +2 из-за заголовков
+
+                    # Получаем старые данные
+                    old_name = record.get('name', 'Не указано')
+                    old_description = record.get('description', 'Не указано')
+
+                    # Создаем новые поля
+                    new_row = [
+                        record.get('product_id', ''),
+                        record.get('supplier_id', ''),
+                        record.get('location_id', ''),
+                        old_name,                    # название
+                        old_description,            # описание
+                        'Не указано',               # производство
+                        'Не указано',               # материал
+                        'Не указано',               # размеры
+                        'Не указано',               # упаковка
+                        record.get('photo_urls', ''),
+                        record.get('quantity', 1),
+                        record.get('created_at', '')
+                    ]
+
+                    # Обновляем строку
+                    self.products_sheet.update(f"A{row_num}:L{row_num}", [new_row])
+                    migrated_count += 1
+
+                    if migrated_count % 10 == 0:
+                        print(f"Смигрировано {migrated_count} товаров...")
+
+                except Exception as e:
+                    print(f"Ошибка при миграции записи {i}: {e}")
+                    continue
+
+            print(f"Миграция завершена! Обновлено {migrated_count} товаров")
+            return True
+
+        except Exception as e:
+            print(f"Критическая ошибка при миграции: {e}")
+            import traceback
+            traceback.print_exc()
             return False
