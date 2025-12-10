@@ -50,6 +50,7 @@ class MarketBot:
         self.image_storage_service = None
         self.content_generation_service = None
         self.services_initialized = False
+        self.setup_handlers()
 
     async def safe_edit_message_text(self, query, text, reply_markup=None, parse_mode=None):
         """Безопасное редактирование сообщения с fallback на caption"""
@@ -66,9 +67,7 @@ class MarketBot:
                 parse_mode=parse_mode
             )
 
-    def setup_handlers(self):
-        pass
-
+  
     async def send_photo_from_telegram_url(self, chat_id: int, photo_url: str, caption: str = None, reply_markup=None):
         """Скачать фото с Telegram URL и отправить его как файл"""
         try:
