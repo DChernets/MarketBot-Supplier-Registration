@@ -16,6 +16,8 @@ class GoogleSheetsManager:
         self.suppliers_sheet = self._get_or_create_sheet("suppliers")
         self.locations_sheet = self._get_or_create_sheet("locations")
         self.products_sheet = self._get_or_create_sheet("products")
+        self.content_usage_sheet = self._get_or_create_sheet("content_usage")
+        self.content_limits_sheet = self._get_or_create_sheet("content_limits")
 
         # Инициализируем заголовки
         self._init_sheet_headers()
@@ -39,11 +41,24 @@ class GoogleSheetsManager:
             "pavilion_number", "contact_phones"
         ]
 
-        # Заголовки для листа products (новая JSON-структура)
+        # Заголовки для листа products (новая JSON-структура с контентом)
         products_headers = [
             "product_id", "supplier_id", "location_id",
             "название", "описание", "производство", "материал", "размеры", "упаковка",
-            "photo_urls", "quantity", "created_at"
+            "photo_urls", "quantity", "created_at",
+            "enhanced_image_url", "enhanced_description", "content_generated_at", "content_version"
+        ]
+
+        # Заголовки для листа content_usage
+        content_usage_headers = [
+            "usage_id", "user_id", "product_id", "action_type",
+            "created_at", "success", "error_message"
+        ]
+
+        # Заголовки для листа content_limits
+        content_limits_headers = [
+            "user_id", "daily_image_generations", "daily_description_generations",
+            "daily_content_enhancements", "last_reset_date", "total_generations"
         ]
 
         # Проверяем и добавляем заголовки если нужно
@@ -64,6 +79,18 @@ class GoogleSheetsManager:
                 self.products_sheet.append_row(products_headers)
         except:
             self.products_sheet.append_row(products_headers)
+
+        try:
+            if not self.content_usage_sheet.get_all_values():
+                self.content_usage_sheet.append_row(content_usage_headers)
+        except:
+            self.content_usage_sheet.append_row(content_usage_headers)
+
+        try:
+            if not self.content_limits_sheet.get_all_values():
+                self.content_limits_sheet.append_row(content_limits_headers)
+        except:
+            self.content_limits_sheet.append_row(content_limits_headers)
 
     def add_supplier(self, internal_id, telegram_user_id, telegram_username, contact_name):
         """Добавление нового поставщика"""
@@ -373,4 +400,223 @@ class GoogleSheetsManager:
             print(f"Критическая ошибка при миграции: {e}")
             import traceback
             traceback.print_exc()
+            return False
+
+    def update_product_enhanced_content(self, product_id: str, enhanced_image_url: str = None,
+                                       enhanced_description: str = None, content_generated_at: str = None):
+        """Обновить улучшенный контент товара"""
+        try:
+            all_records = self.products_sheet.get_all_records()
+
+            for i, record in enumerate(all_records):
+                if record.get("product_id") == product_id or str(record.get("product_id")) == str(product_id):
+                    row_num = i + 2  # +2 из-за заголовков
+
+                    # Получаем текущие данные
+                    current_data = [
+                        record.get('product_id', ''),
+                        record.get('supplier_id', ''),
+                        record.get('location_id', ''),
+                        record.get('название', ''),
+                        record.get('описание', ''),
+                        record.get('производство', ''),
+                        record.get('материал', ''),
+                        record.get('размеры', ''),
+                        record.get('упаковка', ''),
+                        record.get('photo_urls', ''),
+                        record.get('quantity', 1),
+                        record.get('created_at', ''),
+                        enhanced_image_url if enhanced_image_url else record.get('enhanced_image_url', ''),
+                        enhanced_description if enhanced_description else record.get('enhanced_description', ''),
+                        content_generated_at if content_generated_at else record.get('content_generated_at', ''),
+                        str(int(record.get('content_version', 1)) + 1) if enhanced_image_url or enhanced_description else record.get('content_version', 1)
+                    ]
+
+                    # Обновляем только новые поля (колонки M-P)
+                    self.products_sheet.update(f"M{row_num}:P{row_num}", [
+                        current_data[12],  # enhanced_image_url
+                        current_data[13],  # enhanced_description
+                        current_data[14],  # content_generated_at
+                        current_data[15]   # content_version
+                    ])
+
+                    logger.info(f"Обновлен улучшенный контент для товара {product_id}")
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении улучшенного контента: {e}")
+            return False
+
+    def add_content_usage(self, usage_record):
+        """Добавить запись об использовании контента"""
+        try:
+            row = [
+                usage_record.usage_id,
+                usage_record.user_id,
+                usage_record.product_id,
+                usage_record.action_type,
+                usage_record.created_at.isoformat(),
+                str(usage_record.success),
+                usage_record.error_message or ""
+            ]
+            self.content_usage_sheet.append_row(row)
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при добавлении записи об использовании: {e}")
+            return False
+
+    def get_content_usage_by_user(self, user_id: int, target_date):
+        """Получить записи об использовании для пользователя за указанную дату"""
+        try:
+            all_records = self.content_usage_sheet.get_all_records()
+            usage_records = []
+
+            target_date_str = target_date.strftime("%Y-%m-%d")
+
+            for record in all_records:
+                user_id_field = record.get("user_id")
+                if (user_id_field == user_id or str(user_id_field) == str(user_id)) and \
+                   record.get("created_at", "").startswith(target_date_str):
+                    usage_records.append(record)
+
+            return usage_records
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении записей об использовании: {e}")
+            return []
+
+    def get_all_content_usage(self, user_id: int):
+        """Получить все записи об использовании для пользователя"""
+        try:
+            all_records = self.content_usage_sheet.get_all_records()
+            usage_records = []
+
+            for record in all_records:
+                user_id_field = record.get("user_id")
+                if user_id_field == user_id or str(user_id_field) == str(user_id):
+                    usage_records.append(record)
+
+            return usage_records
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении всех записей об использовании: {e}")
+            return []
+
+    def update_or_create_content_limits(self, user_id: int, action_type: str):
+        """Обновить или создать лимиты для пользователя"""
+        try:
+            from datetime import datetime, date
+            today = date.today()
+
+            # Ищем существующие лимиты
+            all_records = self.content_limits_sheet.get_all_records()
+
+            for record in all_records:
+                user_id_field = record.get("user_id")
+                if user_id_field == user_id or str(user_id_field) == str(user_id):
+                    # Обновляем существующую запись
+                    row_num = all_records.index(record) + 2
+
+                    # Обновляем счетчики в зависимости от типа действия
+                    daily_image = int(record.get("daily_image_generations", 0))
+                    daily_description = int(record.get("daily_description_generations", 0))
+                    daily_enhancement = int(record.get("daily_content_enhancements", 0))
+
+                    if action_type == "image_generation":
+                        daily_image += 1
+                    elif action_type == "description_generation":
+                        daily_description += 1
+                    elif action_type == "content_enhancement":
+                        daily_enhancement += 1
+
+                    # Проверяем, нужно ли сбросить счетчики (новый день)
+                    last_reset = record.get("last_reset_date", "")
+                    if last_reset != today.isoformat():
+                        daily_image = 0
+                        daily_description = 0
+                        daily_enhancement = 0
+
+                    updated_row = [
+                        user_id,
+                        daily_image,
+                        daily_description,
+                        daily_enhancement,
+                        today.isoformat(),
+                        int(record.get("total_generations", 0)) + 1
+                    ]
+
+                    self.content_limits_sheet.update(f"A{row_num}:F{row_num}", updated_row)
+                    return True
+
+            # Создаем новую запись, если не нашли существующую
+            new_row = [
+                user_id,
+                1 if action_type == "image_generation" else 0,
+                1 if action_type == "description_generation" else 0,
+                1 if action_type == "content_enhancement" else 0,
+                today.isoformat(),
+                1
+            ]
+
+            self.content_limits_sheet.append_row(new_row)
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении лимитов: {e}")
+            return False
+
+    def reset_daily_limits(self, reset_date):
+        """Сбросить дневные лимиты для всех пользователей"""
+        try:
+            reset_date_str = reset_date.isoformat()
+
+            all_records = self.content_limits_sheet.get_all_records()
+
+            for i, record in enumerate(all_records):
+                row_num = i + 2
+                updated_row = [
+                    record.get("user_id"),
+                    0,  # daily_image_generations
+                    0,  # daily_description_generations
+                    0,  # daily_content_enhancements
+                    reset_date_str,
+                    record.get("total_generations", 0)
+                ]
+
+                self.content_limits_sheet.update(f"A{row_num}:F{row_num}", updated_row)
+
+            logger.info(f"Дневные лимиты сброшены для {len(all_records)} пользователей")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при сбросе дневных лимитов: {e}")
+            return False
+
+    def cleanup_old_usage_records(self, cutoff_date):
+        """Очистить старые записи об использовании"""
+        try:
+            cutoff_date_str = cutoff_date.isoformat()
+            all_records = self.content_usage_sheet.get_all_records()
+
+            # Фильтруем записи, которые нужно удалить
+            rows_to_delete = []
+            for i, record in enumerate(all_records):
+                if record.get("created_at", "") < cutoff_date_str:
+                    rows_to_delete.append(i + 2)  # +2 из-за заголовков
+
+            # Удаляем старые записи (в обратном порядке, чтобы индексы не сдвигались)
+            for row_num in sorted(rows_to_delete, reverse=True):
+                self.content_usage_sheet.delete_rows(row_num, 1)
+
+            if rows_to_delete:
+                logger.info(f"Удалено {len(rows_to_delete)} старых записей об использовании")
+                return True
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при очистке старых записей: {e}")
             return False

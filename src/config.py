@@ -40,3 +40,19 @@ if HTTP_PROXY or HTTPS_PROXY:
     })
     opener = urllib.request.build_opener(proxy_handler)
     urllib.request.install_opener(opener)
+
+# Content Generation Settings
+ENABLE_CONTENT_GENERATION = os.getenv("ENABLE_CONTENT_GENERATION", "True").lower() == "true"
+DAILY_IMAGE_GENERATION_LIMIT = int(os.getenv("DAILY_IMAGE_GENERATION_LIMIT", "1"))
+DAILY_DESCRIPTION_GENERATION_LIMIT = int(os.getenv("DAILY_DESCRIPTION_GENERATION_LIMIT", "1"))
+DAILY_CONTENT_ENHANCEMENT_LIMIT = int(os.getenv("DAILY_CONTENT_ENHANCEMENT_LIMIT", "1"))
+
+# Background Templates Settings
+BACKGROUND_TEMPLATES_PATH = os.getenv("BACKGROUND_TEMPLATES_PATH", "assets/backgrounds/")
+MAX_IMAGE_SIZE = (1920, 1080)  # 16:9 соотношение для контент-генерации
+ENHANCED_IMAGE_QUALITY = 95
+ENHANCED_IMAGE_FORMAT = "JPEG"
+
+# Content Generation Auto-enhancement Settings
+AUTO_GENERATE_CONTENT = os.getenv("AUTO_GENERATE_CONTENT", "True").lower() == "true"
+PREFERRED_BACKGROUND_TYPE = os.getenv("PREFERRED_BACKGROUND_TYPE", "professional")  # "professional" or "marketing"

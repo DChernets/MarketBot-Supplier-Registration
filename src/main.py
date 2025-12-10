@@ -5,10 +5,11 @@ import requests
 from io import BytesIO
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler
-from src.config import TELEGRAM_BOT_TOKEN, DEBUG
+from src.config import TELEGRAM_BOT_TOKEN, DEBUG, ENABLE_CONTENT_GENERATION, AUTO_GENERATE_CONTENT
 from src.google_sheets import GoogleSheetsManager
 from src.gemini_service import get_gemini_service, initialize_gemini_service
 from src.image_storage import get_image_storage_service, initialize_image_storage
+from src.content_generation_service import get_content_generation_service
 
 # Включаем логирование
 logging.basicConfig(
@@ -33,6 +34,7 @@ class MarketBot:
         self.sheets_manager = None
         self.gemini_service = None
         self.image_storage_service = None
+        self.content_generation_service = None
         self.services_initialized = False
         self.setup_handlers()
 
@@ -205,6 +207,14 @@ class MarketBot:
                 logger.info("Сервис хранения изображений успешно инициализирован")
             else:
                 logger.warning("Не удалось инициализировать сервис хранения изображений")
+
+            # Инициализация сервиса генерации контента
+            if ENABLE_CONTENT_GENERATION:
+                try:
+                    self.content_generation_service = get_content_generation_service(self.sheets_manager)
+                    logger.info("Сервис генерации контента успешно инициализирован")
+                except Exception as e:
+                    logger.warning(f"Не удалось инициализировать сервис генерации контента: {e}")
 
             self.services_initialized = True
             return True
@@ -385,6 +395,12 @@ class MarketBot:
         elif query.data == 'cancel_photo_upload':
             logger.info(f"handle_callback: calling cancel_photo_recognition")
             await self.cancel_photo_recognition(update, context)
+        elif query.data.startswith('enhance_content_'):
+            logger.info(f"handle_callback: calling enhance_product_content")
+            await self.enhance_product_content(update, context)
+        elif query.data.startswith('enhance_content_limit_'):
+            logger.info(f"handle_callback: calling enhance_content_limit_info")
+            await self.enhance_content_limit_info(update, context)
         else:
             logger.warning(f"handle_callback: unknown callback data pattern: {query.data}")
 
@@ -1436,10 +1452,32 @@ class MarketBot:
                         caption += f"📅 Добавлен: {created_at}\n"
 
                     # Кнопки управления для товара
-                    product_buttons = [
+                    product_buttons = []
+
+                    # Добавляем кнопку улучшения контента если доступна генерация
+                    if ENABLE_CONTENT_GENERATION and self.content_generation_service:
+                        # Проверяем, доступна ли генерация для этого товара
+                        try:
+                            limit_check = self.content_generation_service.usage_limits.check_daily_limit(
+                                user_id, product_id, 'content_enhancement'
+                            )
+                            if limit_check['allowed']:
+                                product_buttons.append(
+                                    InlineKeyboardButton(f"✨ Улучшить контент", callback_data=f"enhance_content_{product_id}")
+                                )
+                            else:
+                                product_buttons.append(
+                                    InlineKeyboardButton(f"✨ Улучшить контент ({limit_check['remaining']})",
+                                                      callback_data=f"enhance_content_limit_{product_id}")
+                                )
+                        except Exception as e:
+                            logger.warning(f"Error checking content generation limits for {product_id}: {e}")
+
+                    # Добавляем стандартные кнопки
+                    product_buttons.extend([
                         InlineKeyboardButton(f"✏️ Редактировать", callback_data=f"edit_product_{product_id}"),
                         InlineKeyboardButton(f"🗑️ Удалить", callback_data=f"delete_product_{product_id}")
-                    ]
+                    ])
 
                     try:
                         # Проверяем и отправляем фото если есть
@@ -2032,6 +2070,10 @@ class MarketBot:
 
                 if success:
                     saved_products += 1
+                    # Сохраняем ID товара для автоматической генерации
+                    if 'saved_product_ids' not in locals():
+                        saved_product_ids = []
+                    saved_product_ids.append(product_id)
 
             # Очищаем контекст
             context.user_data.clear()
@@ -2042,9 +2084,172 @@ class MarketBot:
                 f"Используйте /profile для просмотра всех товаров."
             )
 
+            # Запускаем автоматическую генерацию контента
+            if saved_products > 0 and 'saved_product_ids' in locals():
+                await self.auto_generate_content_for_products(update, context, saved_product_ids)
+
         except Exception as e:
             logger.error(f"Error in save_products: {e}")
             await update.message.reply_text("❌ Ошибка при сохранении товаров")
+
+    async def auto_generate_content_for_products(self, update: Update, context, product_ids: list):
+        """Автоматически генерирует контент для сохраненных товаров"""
+        if not ENABLE_CONTENT_GENERATION or not AUTO_GENERATE_CONTENT:
+            return
+
+        if not self.content_generation_service:
+            logger.warning("Сервис генерации контента не доступен")
+            return
+
+        try:
+            user_id = update.effective_user.id
+            logger.info(f"Starting automatic content generation for {len(product_ids)} products")
+
+            # Показываем сообщение о начале генерации
+            status_message = await update.message.reply_text(
+                "🔄 *Автоматическая генерация контента...*\n\n"
+                "Для ваших товаров создаются профессиональные изображения и B2B описания.\n"
+                "Это может занять некоторое время.",
+                parse_mode='Markdown'
+            )
+
+            enhanced_products = []
+            failed_products = []
+
+            for i, product_id in enumerate(product_ids):
+                try:
+                    logger.info(f"Processing product {i+1}/{len(product_ids)}: {product_id}")
+
+                    # Получаем информацию о товаре
+                    product = self.sheets_manager.get_product_by_id(product_id)
+                    if not product:
+                        logger.warning(f"Product {product_id} not found")
+                        failed_products.append(product_id)
+                        continue
+
+                    # Получаем оригинальное изображение
+                    image_bytes = None
+                    photo_url = product.get('photo_urls', '')
+                    if photo_url:
+                        try:
+                            response = requests.get(photo_url, timeout=10)
+                            if response.status_code == 200:
+                                image_bytes = response.content
+                                logger.info(f"Downloaded image for product {product_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to download image for {product_id}: {e}")
+
+                    # Проверяем лимиты
+                    limit_check = self.content_generation_service.usage_limits.check_daily_limit(
+                        user_id, product_id, 'content_enhancement'
+                    )
+
+                    if not limit_check['allowed']:
+                        logger.info(f"Content generation limit reached for product {product_id}")
+                        failed_products.append(product_id)
+                        continue
+
+                    # Запускаем генерацию контента
+                    result = await self.content_generation_service.enhance_product_content(
+                        user_id=user_id,
+                        product_info=product,
+                        image_bytes=image_bytes
+                    )
+
+                    if result.get('success'):
+                        enhanced_products.append({
+                            'product_id': product_id,
+                            'product_name': product.get('название', 'Товар'),
+                            'enhanced_image_url': result.get('enhanced_image_url'),
+                            'enhanced_description': result.get('enhanced_description'),
+                            'background_used': result.get('background_used')
+                        })
+                        logger.info(f"Successfully enhanced content for product {product_id}")
+                    else:
+                        logger.warning(f"Content enhancement failed for product {product_id}: {result.get('error')}")
+                        failed_products.append(product_id)
+
+                except Exception as e:
+                    logger.error(f"Error processing product {product_id}: {e}")
+                    failed_products.append(product_id)
+
+            # Отправляем результаты
+            await self.send_content_generation_results(update, enhanced_products, failed_products, status_message)
+
+        except Exception as e:
+            logger.error(f"Error in auto_generate_content_for_products: {e}")
+            await update.message.reply_text(
+                "⚠️ Произошла ошибка при автоматической генерации контента. "
+                "Вы можете попробовать сгенерировать контент вручную через кнопку '✨ Улучшить контент'."
+            )
+
+    async def send_content_generation_results(self, update: Update, enhanced_products: list,
+                                            failed_products: list, status_message):
+        """Отправляет результаты генерации контента"""
+        try:
+            # Обновляем статус сообщения
+            if enhanced_products:
+                status_text = f"✅ *Автоматическая генерация завершена!*\n\n"
+                status_text += f"🎨 Улучшено товаров: {len(enhanced_products)}\n"
+
+                if failed_products:
+                    status_text += f"⚠️ Пропущено: {len(failed_products)}\n"
+
+                status_text += f"\nВаши товары теперь имеют профессиональные изображения и B2B описания!"
+
+                await status_message.edit_text(status_text, parse_mode='Markdown')
+
+                # Показываем несколько примеров улучшенных товаров
+                sample_products = enhanced_products[:2]  # Показываем максимум 2 примера
+
+                for product in sample_products:
+                    await self.show_enhanced_product_example(update, product)
+            else:
+                await status_message.edit_text(
+                    "⚠️ Автоматическая генерация контента не удалась. "
+                    "Вы можете попробовать сгенерировать контент вручную через кнопку '✨ Улучшить контент' в списке товаров."
+                )
+
+        except Exception as e:
+            logger.error(f"Error sending content generation results: {e}")
+
+    async def show_enhanced_product_example(self, update: Update, enhanced_product: dict):
+        """Показывает пример улучшенного товара"""
+        try:
+            product_id = enhanced_product['product_id']
+            product_name = enhanced_product['product_name']
+            enhanced_image_url = enhanced_product.get('enhanced_image_url')
+            enhanced_description = enhanced_product.get('enhanced_description')
+
+            caption = f"🎨 *Пример улучшенного товара*\n\n"
+            caption += f"🏷️ {product_name}\n"
+
+            if enhanced_description:
+                caption += f"📝 *Новое B2B описание:*\n{enhanced_description}\n"
+
+            caption += f"\n💡 Чтобы управлять контентом для всех товаров, используйте /my_products"
+
+            keyboard = [[InlineKeyboardButton("📦 Мои товары", callback_data="my_products")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            if enhanced_image_url:
+                # Пытаемся отправить улучшенное изображение
+                success = await self.send_photo_from_telegram_url(
+                    chat_id=update.effective_user.id,
+                    photo_url=enhanced_image_url,
+                    caption=caption,
+                    reply_markup=reply_markup
+                )
+
+                if not success:
+                    # Если не удалось, отправляем только текст
+                    caption += f"\n🖼️ [Улучшенное изображение]({enhanced_image_url})"
+                    await update.message.reply_text(caption, parse_mode='Markdown', reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(caption, parse_mode='Markdown', reply_markup=reply_markup)
+
+        except Exception as e:
+            logger.error(f"Error showing enhanced product example: {e}")
 
     async def show_my_locations(self, update: Update, context):
         """Показать мои локации"""
@@ -2109,6 +2314,218 @@ class MarketBot:
         except Exception as e:
             logger.error(f"Error in show_my_locations: {e}")
             await update.callback_query.edit_message_text("❌ Ошибка при загрузке локаций")
+
+    async def enhance_product_content(self, update: Update, context):
+        """Обработчик кнопки '✨ Улучшить контент'"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            if not ENABLE_CONTENT_GENERATION or not self.content_generation_service:
+                await query.edit_message_text(
+                    "❌ Функция генерации контента временно недоступна"
+                )
+                return
+
+            # Извлекаем ID товара
+            product_id = query.data.replace('enhance_content_', '')
+            user_id = query.from_user.id
+
+            # Проверяем лимиты
+            limit_check = self.content_generation_service.usage_limits.check_daily_limit(
+                user_id, product_id, 'content_enhancement'
+            )
+
+            if not limit_check['allowed']:
+                await query.edit_message_text(
+                    f"⏰ {limit_check['message']}\n\n"
+                    "Вы сможете улучшить контент этого товара завтра.\n"
+                    "Лимит обновляется в 00:00 по МСК."
+                )
+                return
+
+            # Получаем информацию о товаре
+            if not self.sheets_manager:
+                self.sheets_manager = GoogleSheetsManager()
+
+            product = self.sheets_manager.get_product_by_id(product_id)
+            if not product:
+                await query.edit_message_text("❌ Товар не найден")
+                return
+
+            # Показываем сообщение о начале генерации
+            await query.edit_message_text(
+                "🔄 *Улучшение контента...*\n\n"
+                "Создаю профессиональное изображение и B2B описание.\n"
+                "Это может занять некоторое время.",
+                parse_mode='Markdown'
+            )
+
+            # Получаем оригинальное изображение
+            image_bytes = None
+            photo_url = product.get('photo_urls', '')
+            if photo_url:
+                try:
+                    response = requests.get(photo_url, timeout=15)
+                    if response.status_code == 200:
+                        image_bytes = response.content
+                        logger.info(f"Downloaded image for product {product_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to download image for {product_id}: {e}")
+
+            # Запускаем генерацию контента
+            result = await self.content_generation_service.enhance_product_content(
+                user_id=user_id,
+                product_info=product,
+                image_bytes=image_bytes
+            )
+
+            # Отправляем результат
+            await self.show_enhanced_content_result(update, product, result)
+
+        except Exception as e:
+            logger.error(f"Error in enhance_product_content: {e}")
+            await update.callback_query.edit_message_text(
+                "❌ Произошла ошибка при улучшении контента. Попробуйте позже."
+            )
+
+    async def enhance_content_limit_info(self, update: Update, context):
+        """Показать информацию о лимитах генерации контента"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            product_id = query.data.replace('enhance_content_limit_', '')
+            user_id = query.from_user.id
+
+            if not self.content_generation_service:
+                await query.edit_message_text(
+                    "❌ Сервис генерации контента недоступен"
+                )
+                return
+
+            # Получаем детальную информацию о лимитах
+            limit_check = self.content_generation_service.usage_limits.check_daily_limit(
+                user_id, product_id, 'content_enhancement'
+            )
+
+            message = f"📊 *Информация о лимитах*\n\n"
+            message += f"🎯 Для этого товара: {limit_check['used']}/{limit_check['limit']} использований сегодня\n"
+            message += f"⏰ Следующее обновление: {limit_check['next_reset'].strftime('%H:%M')}\n\n"
+            message += f"Лимиты на генерацию контента установлены для обеспечения\n"
+            message += f"стабильной работы сервиса для всех пользователей.\n\n"
+            message += f"💡 Вы можете улучшать контент других товаров\n"
+            message += f"или подождать до следующего обновления лимитов."
+
+            keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in enhance_content_limit_info: {e}")
+            await update.callback_query.edit_message_text("❌ Ошибка при загрузке информации")
+
+    async def show_enhanced_content_result(self, update: Update, original_product: dict, result: dict):
+        """Показать результат улучшения контента"""
+        try:
+            query = update.callback_query
+            product_id = original_product.get('product_id', 'unknown')
+            product_name = original_product.get('название', 'Товар')
+
+            if not result.get('success'):
+                error_message = f"❌ *Не удалось улучшить контент*\n\n"
+                error_message += f"🏷️ {product_name}\n"
+                error_message += f"🔸 Ошибка: {result.get('error', 'Неизвестная ошибка')}\n\n"
+                error_message += f"Попробуйте позже или обратитесь в поддержку."
+
+                keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await query.edit_message_text(
+                    error_message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                return
+
+            # Формируем сообщение об успешном улучшении
+            success_message = f"✅ *Контент успешно улучшен!*\n\n"
+            success_message += f"🏷️ {product_name}\n"
+
+            enhanced_image_url = result.get('enhanced_image_url')
+            enhanced_description = result.get('enhanced_description')
+            background_used = result.get('background_used')
+            variations = result.get('variations', [])
+
+            if enhanced_description:
+                success_message += f"\n📝 *Новое B2B описание:*\n{enhanced_description}\n"
+
+            if background_used:
+                bg_names = {
+                    'professional_white': 'Профессиональный белый',
+                    'professional_gray': 'Профессиональный серый',
+                    'professional_black': 'Профессиональный черный',
+                    'marketing_blue': 'Маркетинговый синий',
+                    'marketing_green': 'Маркетинговый зеленый'
+                }
+                bg_name = bg_names.get(background_used, background_used)
+                success_message += f"\n🎨 Использован фон: {bg_name}\n"
+
+            if variations:
+                success_message += f"\n💡 Дополнительные варианты описания:\n"
+                for i, variation in enumerate(variations[:2], 1):  # Показываем первые 2 варианта
+                    success_message += f"{i}. {variation}\n"
+
+            success_message += f"\n💎 Ваш товар теперь выглядит профессионально для B2B продаж!"
+
+            keyboard = [[InlineKeyboardButton("📦 Мои товары", callback_data="my_products")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Если есть улучшенное изображение, показываем его
+            if enhanced_image_url:
+                # Сначала редактируем текущее сообщение с текстом
+                await query.edit_message_text(
+                    success_message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+                # Затем отправляем отдельное сообщение с фото
+                success = await self.send_photo_from_telegram_url(
+                    chat_id=query.from_user.id,
+                    photo_url=enhanced_image_url,
+                    caption=f"🎨 *Улучшенное изображение для {product_name}*\n\n"
+                            f"Профессиональный фон и оптимизация для B2B продаж",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+                if not success:
+                    # Если фото не отправилось, добавляем ссылку в текст
+                    success_message += f"\n\n🖼️ [Улучшенное изображение]({enhanced_image_url})"
+                    await query.edit_message_text(
+                        success_message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+            else:
+                # Если нет изображения, просто показываем текст
+                await query.edit_message_text(
+                    success_message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error in show_enhanced_content_result: {e}")
+            await update.callback_query.edit_message_text(
+                "❌ Ошибка при отображении результата улучшения контента"
+            )
 
     def run(self):
         """Запуск бота"""
