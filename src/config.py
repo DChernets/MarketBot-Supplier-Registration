@@ -26,3 +26,17 @@ PHOTO_QUALITY = 85
 
 # Google Drive Folder Settings
 DRIVE_FOLDER_NAME = "MarketBot Images"
+
+# Proxy Settings
+HTTP_PROXY = os.getenv("HTTP_PROXY")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY")
+
+# Configure proxy for all HTTP requests
+if HTTP_PROXY or HTTPS_PROXY:
+    import urllib.request
+    proxy_handler = urllib.request.ProxyHandler({
+        'http': HTTP_PROXY,
+        'https': HTTPS_PROXY
+    })
+    opener = urllib.request.build_opener(proxy_handler)
+    urllib.request.install_opener(opener)

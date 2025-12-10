@@ -10,7 +10,17 @@ import logging
 from typing import Optional, Dict, Any, List
 from PIL import Image
 import io
-from src.config import GEMINI_API_KEY, GEMINI_MODEL
+from src.config import GEMINI_API_KEY, GEMINI_MODEL, HTTP_PROXY, HTTPS_PROXY
+
+# Configure proxy for all HTTP requests including google.generativeai
+if HTTP_PROXY or HTTPS_PROXY:
+    import os
+    if HTTP_PROXY:
+        os.environ['HTTP_PROXY'] = HTTP_PROXY
+        os.environ['http_proxy'] = HTTP_PROXY
+    if HTTPS_PROXY:
+        os.environ['HTTPS_PROXY'] = HTTPS_PROXY
+        os.environ['https_proxy'] = HTTPS_PROXY
 
 logger = logging.getLogger(__name__)
 

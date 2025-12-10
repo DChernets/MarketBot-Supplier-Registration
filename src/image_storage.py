@@ -15,7 +15,15 @@ from PIL import Image
 import io
 from datetime import datetime
 import uuid
-from src.config import GOOGLE_SHEETS_CREDENTIALS_FILE, GOOGLE_DRIVE_SCOPES, DRIVE_FOLDER_NAME, MAX_PHOTO_SIZE_MB, SUPPORTED_PHOTO_FORMATS, PHOTO_QUALITY
+from src.config import GOOGLE_SHEETS_CREDENTIALS_FILE, GOOGLE_DRIVE_SCOPES, DRIVE_FOLDER_NAME, MAX_PHOTO_SIZE_MB, SUPPORTED_PHOTO_FORMATS, PHOTO_QUALITY, HTTP_PROXY, HTTPS_PROXY
+
+# Configure proxy for Google APIs
+if HTTP_PROXY or HTTPS_PROXY:
+    import os
+    if HTTP_PROXY:
+        os.environ['HTTP_PROXY'] = HTTP_PROXY
+    if HTTPS_PROXY:
+        os.environ['HTTPS_PROXY'] = HTTPS_PROXY
 
 logger = logging.getLogger(__name__)
 
