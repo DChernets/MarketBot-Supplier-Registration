@@ -1372,6 +1372,10 @@ class MarketBot:
             if not self.sheets_manager:
                 self.sheets_manager = GoogleSheetsManager()
 
+            # Инициализируем сервисы если необходимо
+            if not self.services_initialized:
+                await self.initialize_services()
+
             user_id = query.from_user.id
             logger.info(f"show_my_products called for user_id: {user_id}")
 
@@ -2027,6 +2031,10 @@ class MarketBot:
         try:
             if not self.sheets_manager:
                 self.sheets_manager = GoogleSheetsManager()
+
+            # Инициализируем сервисы если необходимо
+            if not self.services_initialized:
+                await self.initialize_services()
 
             user_id = update.effective_user.id
             supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
