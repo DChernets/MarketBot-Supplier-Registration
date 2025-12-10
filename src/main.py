@@ -1,4 +1,5 @@
 import logging
+from logging.handlers import RotatingFileHandler
 import uuid
 import asyncio
 import requests
@@ -11,12 +12,25 @@ from src.gemini_service import get_gemini_service, initialize_gemini_service
 from src.image_storage import get_image_storage_service, initialize_image_storage
 from src.content_generation_service import get_content_generation_service
 
-# Включаем логирование
+# Создаем директорию для логов, если не существует
+import os
+os.makedirs('logs', exist_ok=True)
+
+# Включаем логирование с ротацией (макс. 5 МБ, 5 файлов)
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_handler = RotatingFileHandler(
+    'logs/bot.log',
+    maxBytes=5*1024*1024,  # 5 МБ
+    backupCount=5,
+    encoding='utf-8'
+)
+log_handler.setFormatter(log_formatter)
+
+# Настройка основного логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.DEBUG if DEBUG else logging.INFO,
     handlers=[
-        logging.FileHandler('logs/bot.log'),
+        log_handler,
         logging.StreamHandler()
     ]
 )
@@ -36,7 +50,24 @@ class MarketBot:
         self.image_storage_service = None
         self.content_generation_service = None
         self.services_initialized = False
-        self.setup_handlers()
+
+    async def safe_edit_message_text(self, query, text, reply_markup=None, parse_mode=None):
+        """Безопасное редактирование сообщения с fallback на caption"""
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+        except Exception:
+            await query.edit_message_caption(
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+
+    def setup_handlers(self):
+        pass
 
     async def send_photo_from_telegram_url(self, chat_id: int, photo_url: str, caption: str = None, reply_markup=None):
         """Скачать фото с Telegram URL и отправить его как файл"""
@@ -361,7 +392,13 @@ class MarketBot:
             await self.start_photo_recognition(update, context)
         elif query.data == 'my_products':
             logger.info(f"handle_callback: calling show_my_products")
-            await self.show_my_products(update, context)
+            try:
+                await self.show_my_products(update, context)
+                logger.info(f"handle_callback: show_my_products completed successfully")
+            except Exception as e:
+                logger.error(f"handle_callback: error in show_my_products: {e}")
+                import traceback
+                logger.error(f"handle_callback: traceback: {traceback.format_exc()}")
         elif query.data == 'my_locations':
             logger.info(f"handle_callback: calling show_my_locations")
             await self.show_my_locations(update, context)
@@ -1374,10 +1411,14 @@ class MarketBot:
 
             # Инициализируем сервисы если необходимо
             if not self.services_initialized:
+                logger.info("Сервисы не инициализированы, начинаем инициализацию в show_my_products")
                 await self.initialize_services()
+                logger.info(f"Сервисы инициализированы. content_generation_service: {self.content_generation_service is not None}")
 
             user_id = query.from_user.id
             logger.info(f"show_my_products called for user_id: {user_id}")
+            logger.info(f"ENABLE_CONTENT_GENERATION: {ENABLE_CONTENT_GENERATION}")
+            logger.info(f"content_generation_service available: {self.content_generation_service is not None}")
 
             supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
             logger.info(f"Supplier found: {supplier is not None}")
@@ -1459,6 +1500,7 @@ class MarketBot:
                     product_buttons = []
 
                     # Добавляем кнопку улучшения контента если доступна генерация
+                    logger.info(f"Проверка кнопки для товара {product_id}: ENABLE_CONTENT_GENERATION={ENABLE_CONTENT_GENERATION}, content_generation_service={self.content_generation_service is not None}")
                     if ENABLE_CONTENT_GENERATION and self.content_generation_service:
                         # Проверяем, доступна ли генерация для этого товара
                         try:
@@ -1569,7 +1611,8 @@ class MarketBot:
 
             try:
                 if hasattr(update, 'callback_query') and update.callback_query:
-                    await update.callback_query.edit_message_text(
+                    await self.safe_edit_message_text(
+                        update.callback_query,
                         "❌ Ошибка при загрузке товаров. Попробуйте еще раз позже."
                     )
                 else:
@@ -2330,9 +2373,14 @@ class MarketBot:
             await query.answer()
 
             if not ENABLE_CONTENT_GENERATION or not self.content_generation_service:
-                await query.edit_message_text(
-                    "❌ Функция генерации контента временно недоступна"
-                )
+                try:
+                    await query.edit_message_text(
+                        "❌ Функция генерации контента временно недоступна"
+                    )
+                except Exception:
+                    await query.edit_message_caption(
+                        "❌ Функция генерации контента временно недоступна"
+                    )
                 return
 
             # Извлекаем ID товара
@@ -2345,11 +2393,18 @@ class MarketBot:
             )
 
             if not limit_check['allowed']:
-                await query.edit_message_text(
-                    f"⏰ {limit_check['message']}\n\n"
-                    "Вы сможете улучшить контент этого товара завтра.\n"
-                    "Лимит обновляется в 00:00 по МСК."
-                )
+                try:
+                    await query.edit_message_text(
+                        f"⏰ {limit_check['message']}\n\n"
+                        "Вы сможете улучшить контент этого товара завтра.\n"
+                        "Лимит обновляется в 00:00 по МСК."
+                    )
+                except Exception:
+                    await query.edit_message_caption(
+                        f"⏰ {limit_check['message']}\n\n"
+                        "Вы сможете улучшить контент этого товара завтра.\n"
+                        "Лимит обновляется в 00:00 по МСК."
+                    )
                 return
 
             # Получаем информацию о товаре
@@ -2358,16 +2413,27 @@ class MarketBot:
 
             product = self.sheets_manager.get_product_by_id(product_id)
             if not product:
-                await query.edit_message_text("❌ Товар не найден")
+                try:
+                    await query.edit_message_text("❌ Товар не найден")
+                except Exception:
+                    await query.edit_message_caption("❌ Товар не найден")
                 return
 
             # Показываем сообщение о начале генерации
-            await query.edit_message_text(
-                "🔄 *Улучшение контента...*\n\n"
-                "Создаю профессиональное изображение и B2B описание.\n"
-                "Это может занять некоторое время.",
-                parse_mode='Markdown'
-            )
+            try:
+                await query.edit_message_text(
+                    "🔄 *Улучшение контента...*\n\n"
+                    "Создаю профессиональное изображение и B2B описание.\n"
+                    "Это может занять некоторое время.",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                await query.edit_message_caption(
+                    "🔄 *Улучшение контента...*\n\n"
+                    "Создаю профессиональное изображение и B2B описание.\n"
+                    "Это может занять некоторое время.",
+                    parse_mode='Markdown'
+                )
 
             # Получаем оригинальное изображение
             image_bytes = None
@@ -2393,9 +2459,14 @@ class MarketBot:
 
         except Exception as e:
             logger.error(f"Error in enhance_product_content: {e}")
-            await update.callback_query.edit_message_text(
-                "❌ Произошла ошибка при улучшении контента. Попробуйте позже."
-            )
+            try:
+                await update.callback_query.edit_message_text(
+                    "❌ Произошла ошибка при улучшении контента. Попробуйте позже."
+                )
+            except Exception:
+                await update.callback_query.edit_message_caption(
+                    "❌ Произошла ошибка при улучшении контента. Попробуйте позже."
+                )
 
     async def enhance_content_limit_info(self, update: Update, context):
         """Показать информацию о лимитах генерации контента"""
@@ -2407,9 +2478,14 @@ class MarketBot:
             user_id = query.from_user.id
 
             if not self.content_generation_service:
-                await query.edit_message_text(
-                    "❌ Сервис генерации контента недоступен"
-                )
+                try:
+                    await query.edit_message_text(
+                        "❌ Сервис генерации контента недоступен"
+                    )
+                except Exception:
+                    await query.edit_message_caption(
+                        "❌ Сервис генерации контента недоступен"
+                    )
                 return
 
             # Получаем детальную информацию о лимитах
@@ -2428,15 +2504,25 @@ class MarketBot:
             keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            await query.edit_message_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
+            try:
+                await query.edit_message_text(
+                    message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                await query.edit_message_caption(
+                    message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
 
         except Exception as e:
             logger.error(f"Error in enhance_content_limit_info: {e}")
-            await update.callback_query.edit_message_text("❌ Ошибка при загрузке информации")
+            try:
+                await update.callback_query.edit_message_text("❌ Ошибка при загрузке информации")
+            except Exception:
+                await update.callback_query.edit_message_caption("❌ Ошибка при загрузке информации")
 
     async def show_enhanced_content_result(self, update: Update, original_product: dict, result: dict):
         """Показать результат улучшения контента"""
@@ -2454,11 +2540,18 @@ class MarketBot:
                 keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
-                await query.edit_message_text(
-                    error_message,
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
+                try:
+                    await query.edit_message_text(
+                        error_message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    await query.edit_message_caption(
+                        error_message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
                 return
 
             # Формируем сообщение об успешном улучшении
@@ -2496,11 +2589,18 @@ class MarketBot:
             # Если есть улучшенное изображение, показываем его
             if enhanced_image_url:
                 # Сначала редактируем текущее сообщение с текстом
-                await query.edit_message_text(
-                    success_message,
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
+                try:
+                    await query.edit_message_text(
+                        success_message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    await query.edit_message_caption(
+                        success_message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
 
                 # Затем отправляем отдельное сообщение с фото
                 success = await self.send_photo_from_telegram_url(
@@ -2515,24 +2615,43 @@ class MarketBot:
                 if not success:
                     # Если фото не отправилось, добавляем ссылку в текст
                     success_message += f"\n\n🖼️ [Улучшенное изображение]({enhanced_image_url})"
+                    try:
+                        await query.edit_message_text(
+                            success_message,
+                            reply_markup=reply_markup,
+                            parse_mode='Markdown'
+                        )
+                    except Exception:
+                        await query.edit_message_caption(
+                            success_message,
+                            reply_markup=reply_markup,
+                            parse_mode='Markdown'
+                        )
+            else:
+                # Если нет изображения, просто показываем текст
+                try:
                     await query.edit_message_text(
                         success_message,
                         reply_markup=reply_markup,
                         parse_mode='Markdown'
                     )
-            else:
-                # Если нет изображения, просто показываем текст
-                await query.edit_message_text(
-                    success_message,
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
+                except Exception:
+                    await query.edit_message_caption(
+                        success_message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
 
         except Exception as e:
             logger.error(f"Error in show_enhanced_content_result: {e}")
-            await update.callback_query.edit_message_text(
-                "❌ Ошибка при отображении результата улучшения контента"
-            )
+            try:
+                await update.callback_query.edit_message_text(
+                    "❌ Ошибка при отображении результата улучшения контента"
+                )
+            except Exception:
+                await update.callback_query.edit_message_caption(
+                    "❌ Ошибка при отображении результата улучшения контента"
+                )
 
     def run(self):
         """Запуск бота"""
