@@ -1,13 +1,10 @@
 import gspread
 from google.oauth2.service_account import Credentials
-from src.config import GOOGLE_SHEETS_CREDENTIALS_FILE, GOOGLE_SHEETS_SPREADSHEET_ID
+from src.config import GOOGLE_SHEETS_CREDENTIALS_FILE, GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_DRIVE_SCOPES
 
 class GoogleSheetsManager:
     def __init__(self):
-        self.scope = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
+        self.scope = GOOGLE_DRIVE_SCOPES
         self.creds = Credentials.from_service_account_file(
             GOOGLE_SHEETS_CREDENTIALS_FILE,
             scopes=self.scope
@@ -18,6 +15,7 @@ class GoogleSheetsManager:
         # Получаем или создаем листы
         self.suppliers_sheet = self._get_or_create_sheet("suppliers")
         self.locations_sheet = self._get_or_create_sheet("locations")
+        self.products_sheet = self._get_or_create_sheet("products")
 
         # Инициализируем заголовки
         self._init_sheet_headers()
@@ -41,6 +39,13 @@ class GoogleSheetsManager:
             "pavilion_number", "contact_phones"
         ]
 
+        # Заголовки для листа products
+        products_headers = [
+            "product_id", "supplier_internal_id", "location_id",
+            "short_description", "full_description", "quantity",
+            "image_urls", "created_at"
+        ]
+
         # Проверяем и добавляем заголовки если нужно
         try:
             if not self.suppliers_sheet.get_all_values():
@@ -53,6 +58,12 @@ class GoogleSheetsManager:
                 self.locations_sheet.append_row(locations_headers)
         except:
             self.locations_sheet.append_row(locations_headers)
+
+        try:
+            if not self.products_sheet.get_all_values():
+                self.products_sheet.append_row(products_headers)
+        except:
+            self.products_sheet.append_row(products_headers)
 
     def add_supplier(self, internal_id, telegram_user_id, telegram_username, contact_name):
         """Добавление нового поставщика"""
@@ -174,4 +185,80 @@ class GoogleSheetsManager:
             print(f"Error deleting location: {e}")
             import traceback
             traceback.print_exc()
+            return False
+
+    def add_product(self, product_id, supplier_internal_id, location_id, short_description,
+                   full_description, quantity, image_urls):
+        """Добавление нового товара"""
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        row = [
+            product_id, supplier_internal_id, location_id,
+            short_description, full_description, quantity,
+            image_urls, now
+        ]
+        self.products_sheet.append_row(row)
+        return product_id
+
+    def get_products_by_supplier_id(self, supplier_internal_id):
+        """Получение всех товаров поставщика"""
+        try:
+            all_records = self.products_sheet.get_all_records()
+            products = []
+            for record in all_records:
+                supplier_id_field = record.get("supplier_internal_id")
+                if supplier_id_field == supplier_internal_id or str(supplier_id_field) == str(supplier_internal_id):
+                    products.append(record)
+            return products
+        except:
+            return []
+
+    def get_product_by_id(self, product_id):
+        """Получение товара по ID"""
+        try:
+            all_records = self.products_sheet.get_all_records()
+            for record in all_records:
+                if record.get("product_id") == product_id or str(record.get("product_id")) == str(product_id):
+                    return record
+            return None
+        except:
+            return None
+
+    def update_product(self, product_id, short_description=None, full_description=None, quantity=None):
+        """Обновление товара"""
+        try:
+            all_records = self.products_sheet.get_all_records()
+            for i, record in enumerate(all_records):
+                if str(record.get("product_id")) == str(product_id):
+                    row_num = i + 2  # +2 из-за заголовков и 0-based индексации
+                    current_row = self.products_sheet.row_values(row_num)
+
+                    # Обновляем только переданные поля
+                    if short_description is not None:
+                        current_row[3] = short_description
+                    if full_description is not None:
+                        current_row[4] = full_description
+                    if quantity is not None:
+                        current_row[5] = quantity
+
+                    self.products_sheet.update(f"A{row_num}:H{row_num}", [current_row])
+                    return True
+            return False
+        except Exception as e:
+            print(f"Error updating product: {e}")
+            return False
+
+    def delete_product(self, product_id):
+        """Удаление товара"""
+        try:
+            all_records = self.products_sheet.get_all_records()
+            for i, record in enumerate(all_records):
+                if str(record.get("product_id")) == str(product_id):
+                    row_num = i + 2  # +2 из-за заголовков и 0-based индексации
+                    self.products_sheet.delete_rows(row_num)
+                    return True
+            return False
+        except Exception as e:
+            print(f"Error deleting product: {e}")
             return False

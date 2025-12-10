@@ -1,9 +1,12 @@
 import logging
 import uuid
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler
 from src.config import TELEGRAM_BOT_TOKEN, DEBUG
 from src.google_sheets import GoogleSheetsManager
+from src.gemini_service import get_gemini_service, initialize_gemini_service
+from src.image_storage import get_image_storage_service, initialize_image_storage
 
 # Включаем логирование
 logging.basicConfig(
@@ -19,10 +22,16 @@ logger = logging.getLogger(__name__)
 # Состояния для ConversationHandler
 NAME, MARKET, PAVILION, PHONE, ADD_MORE_PHONES, ADD_MORE_PHONES_CALLBACK, ADD_LOCATION, ADD_LOCATION_CALLBACK = range(8)
 
+# Новые состояния для распознавания изображений
+PHOTO_UPLOAD, PHOTO_CONFIRMATION, LOCATION_SELECTION, QUANTITY_INPUT, PRODUCT_CONFIRMATION, PRODUCT_MANAGEMENT = range(8, 14)
+
 class MarketBot:
     def __init__(self):
         self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         self.sheets_manager = None
+        self.gemini_service = None
+        self.image_storage_service = None
+        self.services_initialized = False
         self.setup_handlers()
 
     def setup_handlers(self):
@@ -33,9 +42,43 @@ class MarketBot:
         self.application.add_handler(CommandHandler('profile', self.profile_command))
         self.application.add_handler(CommandHandler('cancel', self.cancel))
 
+        # Обработчики для фото
+        self.application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo_message))
+
         # Глобальные обработчики для текстовых сообщений и кнопок
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback, pattern=r'.*'))
+
+    async def initialize_services(self):
+        """Инициализация сервисов"""
+        if self.services_initialized:
+            return True
+
+        try:
+            logger.info("Инициализация сервисов распознавания изображений")
+
+            # Инициализация Gemini сервиса
+            gemini_initialized = await initialize_gemini_service()
+            if gemini_initialized:
+                self.gemini_service = get_gemini_service()
+                logger.info("Gemini сервис успешно инициализирован")
+            else:
+                logger.warning("Не удалось инициализировать Gemini сервис")
+
+            # Инициализация сервиса хранения изображений
+            storage_initialized = await initialize_image_storage()
+            if storage_initialized:
+                self.image_storage_service = get_image_storage_service()
+                logger.info("Сервис хранения изображений успешно инициализирован")
+            else:
+                logger.warning("Не удалось инициализировать сервис хранения изображений")
+
+            self.services_initialized = True
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка инициализации сервисов: {e}")
+            return False
 
     async def start_command(self, update: Update, context):
         """Обработчик команды /start"""
@@ -124,6 +167,10 @@ class MarketBot:
             await self.handle_phone_edit(update, context)
         elif state == 'adding_phone' or edit_state == 'adding_phone':
             await self.handle_add_phone(update, context)
+        elif state == PHOTO_UPLOAD:
+            await self.handle_photo_upload_text(update, context)
+        elif state == QUANTITY_INPUT:
+            await self.handle_quantity_input(update, context)
         else:
             logger.info(f"handle_text_message: unhandled state '{state}' for message '{message_text}'")
 
@@ -166,6 +213,33 @@ class MarketBot:
         elif query.data in ['edit_supplier', 'add_location_post']:
             logger.info(f"handle_callback: calling post_registration_callback")
             await self.post_registration_callback(update, context)
+        elif query.data == 'photo_recognition':
+            logger.info(f"handle_callback: calling start_photo_recognition")
+            await self.start_photo_recognition(update, context)
+        elif query.data == 'my_products':
+            logger.info(f"handle_callback: calling show_my_products")
+            await self.show_my_products(update, context)
+        elif query.data == 'confirm_photo_recognition':
+            logger.info(f"handle_callback: calling confirm_photo_recognition")
+            await self.confirm_photo_recognition(update, context)
+        elif query.data == 'edit_photo_recognition':
+            logger.info(f"handle_callback: calling edit_photo_recognition")
+            await self.edit_photo_recognition(update, context)
+        elif query.data == 'back_to_photo_upload':
+            logger.info(f"handle_callback: calling back_to_photo_upload")
+            await self.back_to_photo_upload(update, context)
+        elif query.data.startswith('select_location_for_product_'):
+            logger.info(f"handle_callback: calling select_location_for_product")
+            await self.select_location_for_product(update, context)
+        elif query.data.startswith('edit_product_'):
+            logger.info(f"handle_callback: calling edit_product")
+            await self.edit_product(update, context)
+        elif query.data.startswith('delete_product_'):
+            logger.info(f"handle_callback: calling delete_product")
+            await self.delete_product(update, context)
+        elif query.data == 'back_to_profile':
+            logger.info(f"handle_callback: calling profile_command")
+            await self.profile_command(update, context)
         else:
             logger.warning(f"handle_callback: unknown callback data pattern: {query.data}")
 
@@ -486,7 +560,9 @@ class MarketBot:
                 # Добавляем общие кнопки управления
                 keyboard.extend([
                     [InlineKeyboardButton("📝 ИЗМЕНИТЬ ИНФОРМАЦИЮ ПОСТАВЩИКА", callback_data="edit_supplier")],
-                    [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")]
+                    [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")],
+                    [InlineKeyboardButton("📸 ФОТО", callback_data="photo_recognition")],
+                    [InlineKeyboardButton("📦 МОИ ТОВАРЫ", callback_data="my_products")]
                 ])
 
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -910,6 +986,545 @@ class MarketBot:
         # Очищаем только состояние редактирования, не весь контекст
         context.user_data['edit_state'] = None
         context.user_data['edit_location_id'] = None
+
+    async def handle_photo_message(self, update: Update, context):
+        """Обработка фото сообщений"""
+        try:
+            state = context.user_data.get('state')
+
+            # Обрабатываем фото только в состоянии PHOTO_UPLOAD
+            if state == PHOTO_UPLOAD:
+                await self.process_photo_upload(update, context)
+            else:
+                logger.info(f"Photo received but state is {state}, ignoring")
+
+        except Exception as e:
+            logger.error(f"Error in handle_photo_message: {e}")
+            await update.message.reply_text("❌ Ошибка при обработке фото")
+
+    async def process_photo_upload(self, update: Update, context):
+        """Обработка загрузки фото"""
+        try:
+            # Инициализируем сервисы если необходимо
+            if not self.services_initialized:
+                await self.initialize_services()
+
+            # Получаем список фото из контекста
+            photos = context.user_data.get('uploaded_photos', [])
+
+            # Проверяем лимит фото
+            if len(photos) >= 10:
+                await update.message.reply_text(
+                    "❌ Достигнут лимит фото (максимум 10).\n"
+                    "Отправьте 'Готово' для обработки или 'Отмена' для выхода."
+                )
+                return
+
+            # Загружаем фото
+            photo = update.message.photo[-1]  # Берем фото наивысшего качества
+            file = await context.bot.get_file(photo.file_id)
+
+            # Скачиваем фото в память
+            photo_bytes = await file.download_as_bytearray()
+
+            # Добавляем фото в список
+            photos.append({
+                'bytes': photo_bytes,
+                'file_id': photo.file_id,
+                'file_name': f"photo_{len(photos) + 1}.jpg"
+            })
+
+            context.user_data['uploaded_photos'] = photos
+
+            await update.message.reply_text(
+                f"✅ Фото {len(photos)} загружено\n"
+                f"Всего загружено: {len(photos)}/10\n\n"
+                "Отправьте еще фото или напишите 'Готово' для обработки"
+            )
+
+        except Exception as e:
+            logger.error(f"Error in process_photo_upload: {e}")
+            await update.message.reply_text("❌ Ошибка при загрузке фото")
+
+    async def show_photo_confirmation(self, update: Update, context):
+        """Показать результаты распознавания фото"""
+        try:
+            recognition_results = context.user_data.get('recognition_results', [])
+
+            if not recognition_results:
+                await update.message.reply_text("❌ Нет результатов распознавания")
+                return
+
+            # Формируем сообщение с результатами
+            message = "🖼️ *Результаты распознавания:*\n\n"
+
+            for i, result in enumerate(recognition_results, 1):
+                short_desc = result.get('short_description', 'Неизвестный товар')
+                full_desc = result.get('full_description', 'Нет описания')
+
+                message += f"📷 *Товар {i}*\n"
+                message += f"🏷️ *Кратко:* {short_desc}\n"
+                message += f"📝 *Подробно:* {full_desc[:200]}{'...' if len(full_desc) > 200 else ''}\n\n"
+
+            # Создаем клавиатуру
+            keyboard = [
+                [InlineKeyboardButton("✅ Верно", callback_data="confirm_photo_recognition")],
+                [InlineKeyboardButton("✏️ Изменить", callback_data="edit_photo_recognition")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_photo_upload")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in show_photo_confirmation: {e}")
+            await update.message.reply_text("❌ Ошибка при показе результатов")
+
+    async def start_photo_recognition(self, update: Update, context):
+        """Начать процесс распознавания фото"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            # Очищаем данные фото
+            context.user_data['uploaded_photos'] = []
+            context.user_data['state'] = PHOTO_UPLOAD
+
+            await query.edit_message_text(
+                "📸 *Распознавание товаров*\n\n"
+                "Пожалуйста, отправьте фотографии товаров (максимум 10 штук).\n"
+                "После загрузки всех фото напишите 'Готово' для распознавания.\n\n"
+                "Отправьте фото или напишите 'Отмена' для выхода:",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in start_photo_recognition: {e}")
+
+    async def show_my_products(self, update: Update, context):
+        """Показать мои товары"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            if not self.sheets_manager:
+                self.sheets_manager = GoogleSheetsManager()
+
+            user_id = query.from_user.id
+            supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
+
+            if not supplier:
+                await query.edit_message_text(
+                    "❌ Вы не зарегистрированы. Используйте /start для регистрации."
+                )
+                return
+
+            supplier_id = supplier['internal_id']
+            products = self.sheets_manager.get_products_by_supplier_id(supplier_id)
+
+            if not products:
+                await query.edit_message_text(
+                    "📦 *Мои товары*\n\n"
+                    "У вас пока нет сохраненных товаров.\n\n"
+                    "Используйте кнопку 📸 ФОТО для добавления товаров.",
+                    parse_mode='Markdown'
+                )
+                return
+
+            # Формируем сообщение с товарами
+            message = "📦 *Мои товары*\n\n"
+
+            keyboard = []
+            for i, product in enumerate(products, 1):
+                short_desc = product.get('short_description', 'Без названия')
+                quantity = product.get('quantity', 'Не указано')
+                created_at = product.get('created_at', '')
+
+                message += f"🏷️ *Товар {i}*: {short_desc}\n"
+                message += f"📊 Количество: {quantity}\n"
+                if created_at:
+                    message += f"📅 Добавлен: {created_at}\n"
+                message += "\n"
+
+                # Добавляем кнопки управления
+                product_buttons = [
+                    InlineKeyboardButton(f"✏️ Редактировать {i}", callback_data=f"edit_product_{product['product_id']}"),
+                    InlineKeyboardButton(f"🗑️ Удалить {i}", callback_data=f"delete_product_{product['product_id']}")
+                ]
+                keyboard.append(product_buttons)
+
+            # Добавляем кнопку возврата
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_profile")])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in show_my_products: {e}")
+            await update.callback_query.edit_message_text("❌ Ошибка при загрузке товаров")
+
+    async def confirm_photo_recognition(self, update: Update, context):
+        """Подтвердить результаты распознавания"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            recognition_results = context.user_data.get('recognition_results', [])
+            if not recognition_results:
+                await query.edit_message_text("❌ Нет результатов для сохранения")
+                return
+
+            context.user_data['state'] = LOCATION_SELECTION
+
+            # Получаем локации пользователя
+            if not self.sheets_manager:
+                self.sheets_manager = GoogleSheetsManager()
+
+            user_id = query.from_user.id
+            supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
+            if not supplier:
+                await query.edit_message_text("❌ Поставщик не найден")
+                return
+
+            locations = self.sheets_manager.get_locations_by_supplier_id(supplier['internal_id'])
+
+            if not locations:
+                await query.edit_message_text(
+                    "❌ У вас нет сохраненных локаций.\n"
+                    "Сначала добавьте локацию через личный кабинет."
+                )
+                return
+
+            # Формируем клавиатуру с локациями
+            message = "📍 *Выберите локацию для товаров:*\n\n"
+            keyboard = []
+
+            for i, location in enumerate(locations, 1):
+                message += f"{i}. {location['market_name']}, пав. {location['pavilion_number']}\n"
+                keyboard.append([InlineKeyboardButton(
+                    f"📍 {i}. {location['market_name']}",
+                    callback_data=f"select_location_for_product_{location['location_id']}"
+                )])
+
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_photo_upload")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in confirm_photo_recognition: {e}")
+
+    async def edit_photo_recognition(self, update: Update, context):
+        """Редактировать результаты распознавания"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            # Возвращаем к загрузке фото
+            context.user_data['state'] = PHOTO_UPLOAD
+            context.user_data['uploaded_photos'] = []
+            context.user_data['recognition_results'] = []
+
+            await query.edit_message_text(
+                "✏️ *Редактирование фото*\n\n"
+                "Отправьте новые фото товаров (максимум 10 штук).\n"
+                "После загрузки всех фото напишите 'Готово' для распознавания.",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in edit_photo_recognition: {e}")
+
+    async def back_to_photo_upload(self, update: Update, context):
+        """Вернуться к загрузке фото"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            context.user_data['state'] = PHOTO_UPLOAD
+
+            # Очищаем результаты распознавания, но сохраняем загруженные фото
+            uploaded_photos = context.user_data.get('uploaded_photos', [])
+
+            if uploaded_photos:
+                message = (
+                    f"📸 *Загрузка фото*\n\n"
+                    f"Загружено фото: {len(uploaded_photos)}/10\n\n"
+                    f"Отправьте еще фото или напишите 'Готово' для распознавания:"
+                )
+            else:
+                message = (
+                    "📸 *Загрузка фото*\n\n"
+                    "Пожалуйста, отправьте фотографии товаров (максимум 10 штук).\n"
+                    "После загрузки всех фото напишите 'Готово' для распознавания:"
+                )
+
+            await query.edit_message_text(message, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Error in back_to_photo_upload: {e}")
+
+    async def select_location_for_product(self, update: Update, context):
+        """Выбрать локацию для товара"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            location_id = query.data.replace('select_location_for_product_', '')
+            context.user_data['selected_location_id'] = location_id
+            context.user_data['state'] = QUANTITY_INPUT
+
+            await query.edit_message_text(
+                "📊 *Введите количество для каждого товара:*\n\n"
+                "Напишите количество через запятую для каждого товара.\n"
+                "Пример: 5, 10, 3\n\n"
+                "Либо напишите 'Пропустить' чтобы использовать количество 1 для всех товаров:",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in select_location_for_product: {e}")
+
+    async def edit_product(self, update: Update, context):
+        """Редактировать товар"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            product_id = query.data.replace('edit_product_', '')
+
+            # Для простоты пока просто показываем информацию о товаре
+            if not self.sheets_manager:
+                self.sheets_manager = GoogleSheetsManager()
+
+            product = self.sheets_manager.get_product_by_id(product_id)
+            if not product:
+                await query.edit_message_text("❌ Товар не найден")
+                return
+
+            message = (
+                f"📦 *Информация о товаре*\n\n"
+                f"🏷️ Название: {product.get('short_description', 'Без названия')}\n"
+                f"📝 Описание: {product.get('full_description', 'Нет описания')}\n"
+                f"📊 Количество: {product.get('quantity', 'Не указано')}\n"
+                f"📅 Добавлен: {product.get('created_at', 'Неизвестно')}\n\n"
+                "*Функция редактирования будет доступна в следующей версии.*"
+            )
+
+            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="my_products")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error in edit_product: {e}")
+
+    async def delete_product(self, update: Update, context):
+        """Удалить товар"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            product_id = query.data.replace('delete_product_', '')
+
+            if not self.sheets_manager:
+                self.sheets_manager = GoogleSheetsManager()
+
+            success = self.sheets_manager.delete_product(product_id)
+
+            if success:
+                await query.edit_message_text(
+                    "✅ Товар успешно удален.\n\n"
+                    "Используйте /profile для просмотра обновленного списка.",
+                    parse_mode='Markdown'
+                )
+            else:
+                await query.edit_message_text("❌ Не удалось удалить товар")
+
+        except Exception as e:
+            logger.error(f"Error in delete_product: {e}")
+
+    async def handle_photo_upload_text(self, update: Update, context):
+        """Обработка текстовых сообщений при загрузке фото"""
+        message_text = update.message.text.strip().lower()
+
+        if message_text == 'готово':
+            await self.process_photo_recognition(update, context)
+        elif message_text == 'отмена':
+            await self.cancel_photo_recognition(update, context)
+        else:
+            await update.message.reply_text(
+                "Отправьте фото или напишите 'Готово' для распознавания, 'Отмена' для выхода"
+            )
+
+    async def process_photo_recognition(self, update: Update, context):
+        """Обработать загруженные фото через распознавание"""
+        try:
+            uploaded_photos = context.user_data.get('uploaded_photos', [])
+
+            if not uploaded_photos:
+                await update.message.reply_text("❌ Нет загруженных фото")
+                return
+
+            await update.message.reply_text("🔄 Начинаю распознавание товаров...")
+
+            # Инициализируем сервисы если необходимо
+            if not self.services_initialized:
+                await self.initialize_services()
+
+            # Распознаем фото
+            recognition_results = []
+            photo_bytes_list = [photo['bytes'] for photo in uploaded_photos]
+
+            if self.gemini_service:
+                recognition_results = await self.gemini_service.recognize_multiple_products(photo_bytes_list)
+            else:
+                # Fallback - используем заглушки
+                for i, photo in enumerate(uploaded_photos):
+                    recognition_results.append({
+                        'short_description': f'Товар {i + 1}',
+                        'full_description': 'Распознавание временно недоступно. Введите описание вручную.'
+                    })
+
+            context.user_data['recognition_results'] = recognition_results
+            context.user_data['state'] = PHOTO_CONFIRMATION
+
+            # Показываем результаты
+            await self.show_photo_confirmation(update, context)
+
+        except Exception as e:
+            logger.error(f"Error in process_photo_recognition: {e}")
+            await update.message.reply_text("❌ Ошибка при распознавании. Попробуйте позже.")
+
+    async def cancel_photo_recognition(self, update: Update, context):
+        """Отменить распознавание фото"""
+        try:
+            context.user_data.clear()
+            context.user_data['state'] = None
+
+            await update.message.reply_text(
+                "❌ Распознавание отменено.\n"
+                "Используйте /profile для возврата в личный кабинет."
+            )
+
+        except Exception as e:
+            logger.error(f"Error in cancel_photo_recognition: {e}")
+
+    async def handle_quantity_input(self, update: Update, context):
+        """Обработка ввода количества товаров"""
+        try:
+            message_text = update.message.text.strip()
+            recognition_results = context.user_data.get('recognition_results', [])
+            selected_location_id = context.user_data.get('selected_location_id')
+
+            if not recognition_results or not selected_location_id:
+                await update.message.reply_text("❌ Ошибка: отсутствуют данные для сохранения")
+                return
+
+            # Парсим количества
+            quantities = []
+            if message_text.lower() == 'пропустить':
+                quantities = [1] * len(recognition_results)
+            else:
+                try:
+                    quantities = [int(q.strip()) for q in message_text.split(',')]
+                    if len(quantities) != len(recognition_results):
+                        # Если количество не совпадает, добавляем или усекаем
+                        while len(quantities) < len(recognition_results):
+                            quantities.append(1)
+                        quantities = quantities[:len(recognition_results)]
+                except ValueError:
+                    await update.message.reply_text(
+                        "❌ Неверный формат. Введите количества через запятую или 'Пропустить'"
+                    )
+                    return
+
+            # Сохраняем товары в базу данных
+            await self.save_products(update, context, quantities)
+
+        except Exception as e:
+            logger.error(f"Error in handle_quantity_input: {e}")
+            await update.message.reply_text("❌ Ошибка при сохранении товаров")
+
+    async def save_products(self, update: Update, context, quantities):
+        """Сохранить товары в базу данных"""
+        try:
+            if not self.sheets_manager:
+                self.sheets_manager = GoogleSheetsManager()
+
+            user_id = update.effective_user.id
+            supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
+            if not supplier:
+                await update.message.reply_text("❌ Поставщик не найден")
+                return
+
+            recognition_results = context.user_data.get('recognition_results', [])
+            selected_location_id = context.user_data.get('selected_location_id')
+            uploaded_photos = context.user_data.get('uploaded_photos', [])
+
+            saved_products = 0
+
+            for i, (result, quantity) in enumerate(zip(recognition_results, quantities)):
+                product_id = str(uuid.uuid4())
+
+                # Загружаем фото в Google Drive (если сервис доступен)
+                image_urls = ""
+                try:
+                    if self.image_storage_service and i < len(uploaded_photos):
+                        photo_data = uploaded_photos[i]
+                        image_url = await self.image_storage_service.upload_image(
+                            photo_data['bytes'],
+                            photo_data['file_name'],
+                            product_id
+                        )
+                        if image_url:
+                            image_urls = image_url
+                except Exception as e:
+                    logger.warning(f"Failed to upload image to Google Drive: {e}")
+
+                # Сохраняем в Google Sheets
+                success = self.sheets_manager.add_product(
+                    product_id=product_id,
+                    supplier_internal_id=supplier['internal_id'],
+                    location_id=selected_location_id,
+                    short_description=result.get('short_description', 'Без названия'),
+                    full_description=result.get('full_description', 'Нет описания'),
+                    quantity=quantity,
+                    image_urls=image_urls
+                )
+
+                if success:
+                    saved_products += 1
+
+            # Очищаем контекст
+            context.user_data.clear()
+            context.user_data['state'] = None
+
+            await update.message.reply_text(
+                f"✅ Успешно сохранено {saved_products} товаров!\n\n"
+                f"Используйте /profile для просмотра всех товаров."
+            )
+
+        except Exception as e:
+            logger.error(f"Error in save_products: {e}")
+            await update.message.reply_text("❌ Ошибка при сохранении товаров")
 
     def run(self):
         """Запуск бота"""
