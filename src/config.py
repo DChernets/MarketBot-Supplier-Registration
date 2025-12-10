@@ -55,4 +55,4 @@ ENHANCED_IMAGE_FORMAT = "JPEG"
 
 # Content Generation Auto-enhancement Settings
 AUTO_GENERATE_CONTENT = os.getenv("AUTO_GENERATE_CONTENT", "True").lower() == "true"
-PREFERRED_BACKGROUND_TYPE = os.getenv("PREFERRED_BACKGROUND_TYPE", "professional")  # "professional" or "marketing"
+PREFERRED_BACKGROUND_TYPE = os.getenv("PREFERRED_BACKGROUND_TYPE", "professional_studio")  # Gemini Vision background types

@@ -2467,11 +2467,10 @@ class MarketBot:
 
             if background_used:
                 bg_names = {
-                    'professional_white': 'Профессиональный белый',
-                    'professional_gray': 'Профессиональный серый',
-                    'professional_black': 'Профессиональный черный',
-                    'marketing_blue': 'Маркетинговый синий',
-                    'marketing_green': 'Маркетинговый зеленый'
+                    'professional_studio': 'Профессиональная студия',
+                    'clean_white_background': 'Чистый белый фон',
+                    'marketing_showcase': 'Маркетинговая витрина',
+                    'minimalist_display': 'Минималистичное отображение'
                 }
                 bg_name = bg_names.get(background_used, background_used)
                 success_message += f"\n🎨 Использован фон: {bg_name}\n"

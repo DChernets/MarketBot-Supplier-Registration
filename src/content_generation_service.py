@@ -6,13 +6,12 @@
 import asyncio
 import io
 import logging
+import base64
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
-from PIL import Image
 import google.generativeai as genai
 
 from src.config import GEMINI_API_KEY, GEMINI_MODEL
-from src.background_templates import get_background_templates
 from src.usage_limits import get_usage_limits
 
 logger = logging.getLogger(__name__)
@@ -23,48 +22,81 @@ class ContentGenerationService:
     def __init__(self, sheets_manager=None):
         """Инициализация сервиса генерации контента"""
         self.sheets_manager = sheets_manager
-        self.background_templates = get_background_templates()
         self.usage_limits = get_usage_limits(sheets_manager)
 
         # Конфигурация Gemini API
         genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel(GEMINI_MODEL)
 
-        logger.info("Сервис генерации контента инициализирован")
+        # Модель для генерации текста
+        self.text_model = genai.GenerativeModel(GEMINI_MODEL)
+
+        # Модель для генерации изображений
+        self.image_model = genai.GenerativeModel("gemini-2.5-flash-image")
+
+        logger.info("Сервис генерации контента инициализирован с Gemini Vision")
 
     async def generate_enhanced_image(self, product_image_bytes: bytes,
                                        product_info: Dict[str, Any],
-                                       background_type: str = "professional_white") -> Optional[bytes]:
+                                       background_type: str = "professional_studio") -> Optional[bytes]:
         """
-        Сгенерировать улучшенное изображение товара на профессиональном фоне
+        Сгенерировать улучшенное изображение товара с помощью Gemini Vision
 
         Args:
             product_image_bytes: Байты изображения товара
             product_info: Информация о товаре
-            background_type: Тип фона
+            background_type: Тип фона (professional_studio, marketing_showcase, etc.)
 
         Returns:
             bytes: Байты улучшенного изображения или None при ошибке
         """
         try:
-            logger.info(f"Начало генерации улучшенного изображения для товара")
+            logger.info(f"Начало генерации улучшенного изображения через Gemini Vision")
 
-            # Конвертируем байты в PIL Image
-            product_image = Image.open(io.BytesIO(product_image_bytes))
+            # Создаем промпт на основе типа фона и информации о товаре
+            prompt = self._create_image_generation_prompt(product_info, background_type)
 
-            # Применяем фон
-            enhanced_image = self.background_templates.apply_background(product_image, background_type)
+            # Кодируем изображение в base64
+            base64_image = base64.b64encode(product_image_bytes).decode('utf-8')
 
-            # Конвертируем обратно в байты
-            enhanced_bytes = io.BytesIO()
-            enhanced_image.save(enhanced_bytes, format='JPEG', quality=95, optimize=True)
-            enhanced_bytes = enhanced_bytes.getvalue()
+            # Создаем контент для Gemini
+            content = [
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": base64_image
+                    }
+                },
+                {
+                    "text": prompt
+                }
+            ]
 
-            logger.info(f"Успешно сгенерировано улучшенное изображение с фоном {background_type}")
-            return enhanced_bytes
+            # Генерируем изображение через Gemini Vision
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.image_model.generate_content(
+                    content,
+                    generation_config={
+                        "temperature": 0.8,
+                        "candidate_count": 1,
+                    }
+                )
+            )
+
+            # Извлекаем сгенерированное изображение
+            if response and response.candidates:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        # Получаем байты изображения
+                        enhanced_bytes = part.inline_data.data
+                        logger.info(f"Успешно сгенерировано изображение через Gemini Vision")
+                        return enhanced_bytes
+
+            logger.warning("Gemini Vision не вернул изображение")
+            return None
 
         except Exception as e:
-            logger.error(f"Ошибка при генерации улучшенного изображения: {e}")
+            logger.error(f"Ошибка при генерации изображения через Gemini Vision: {e}")
             return None
 
     async def generate_b2b_description(self, product_info: Dict[str, Any]) -> Optional[str]:
@@ -86,7 +118,7 @@ class ContentGenerationService:
             # Генерируем описание
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.model.generate_content(
+                lambda: self.text_model.generate_content(
                     prompt,
                     generation_config={
                         "temperature": 0.7,
@@ -130,7 +162,7 @@ class ContentGenerationService:
 
                 response = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self.model.generate_content(
+                    lambda: self.text_model.generate_content(
                         prompt,
                         generation_config={
                             "temperature": 0.8 + (i * 0.1),  # Разная температура для разнообразия
@@ -194,14 +226,15 @@ class ContentGenerationService:
                 'background_used': None
             }
 
-            # Выбираем случайный профессиональный фон
-            background_template = self.background_templates.get_random_template("professional")
-            result['background_used'] = background_template.template_id
+            # Выбираем тип профессионального фона для Gemini Vision
+            background_types = ["professional_studio", "clean_white_background", "marketing_showcase", "minimalist_display"]
+            selected_background = "professional_studio"  # По умолчанию
+            result['background_used'] = selected_background
 
-            # Генерируем улучшенное изображение
+            # Генерируем улучшенное изображение через Gemini Vision
             if image_bytes:
                 enhanced_image_bytes = await self.generate_enhanced_image(
-                    image_bytes, product_info, background_template.template_id
+                    image_bytes, product_info, selected_background
                 )
 
                 if enhanced_image_bytes:
@@ -370,7 +403,7 @@ class ContentGenerationService:
 
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.model.generate_content(
+                lambda: self.text_model.generate_content(
                     prompt,
                     generation_config={
                         "temperature": 0.8,
@@ -386,6 +419,74 @@ class ContentGenerationService:
         except Exception as e:
             logger.error(f"Ошибка при генерации описания для витрины: {e}")
             return None
+
+    def _create_image_generation_prompt(self, product_info: Dict[str, Any], background_type: str) -> str:
+        """
+        Создать промпт для генерации изображения через Gemini Vision
+
+        Args:
+            product_info: Информация о товаре
+            background_type: Тип фона
+
+        Returns:
+            str: Промпт для генерации изображения
+        """
+        product_name = product_info.get('название', 'товар')
+        description = product_info.get('описание', '')
+
+        # Базовые инструкции для B2B качества
+        base_instructions = """
+Создай профессиональное рекламное изображение для B2B продаж товара.
+ТОВАР ДОЛЕН ЗАНИМАТЬ НЕ МЕНЕЕ 60% ПЛОЩАДИ ИЗОБРАЖЕНИЯ.
+"""
+
+        # Промпты для разных типов фонов
+        background_prompts = {
+            "professional_studio": f"""
+{base_instructions}
+Размести этот товар {product_name} в профессиональной фотостудии с чистым белым фоном.
+Добавь мягкое студийное освещение, которое подчеркивает детали товара.
+Изображение должно быть идеальным для B2B каталогов и оптовых заказов.
+Описание товара: {description}
+""",
+            "clean_white_background": f"""
+{base_instructions}
+Покажи товар {product_name} на идеально чистом белом фоне.
+Используй равномерное освещение без теней.
+Максимальная детализация для технических характеристик.
+Описание товара: {description}
+""",
+            "marketing_showcase": f"""
+{base_instructions}
+Размести товар {product_name} в маркетинговой витрине с элегантным светло-серым фоном.
+Добавь легкие блики и профессиональные акценты.
+Сделай изображение привлекательным для оптовых покупателей.
+Описание товара: {description}
+""",
+            "minimalist_display": f"""
+{base_instructions}
+Покажи товар {product_name} в минималистичном стиле на нейтральном фоне.
+Используй современное освещение и чистую композицию.
+Идеально для B2B презентаций и каталогов.
+Описание товара: {description}
+"""
+        }
+
+        # Получаем промпт для указанного типа фона
+        prompt = background_prompts.get(background_type, background_prompts["professional_studio"])
+
+        # Добавляем общие требования к качеству
+        prompt += """
+РЕЖИМ: Генерация изображения (не только текст)
+КАЧЕСТВО: Высокое разрешение, профессиональная обработка
+ЦЕЛЕВАЯ АУДИТОРИЯ: B2B, оптовые покупатели, бизнес-клиенты
+ФОРМАТ: Квадратное или прямоугольное изображение
+СТИЛЬ: Чистый, профессиональный, коммерческий
+
+Отвечай только сгенерированным изображением без лишнего текста.
+"""
+
+        return prompt
 
     def get_background_previews(self) -> Dict[str, Any]:
         """
@@ -456,7 +557,7 @@ class ContentGenerationService:
 
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.model.generate_content(
+                lambda: self.text_model.generate_content(
                     prompt,
                     generation_config={
                         "temperature": 0.3,
