@@ -1030,13 +1030,19 @@ class MarketBot:
             photo = update.message.photo[-1]  # Берем фото наивысшего качества
             file = await context.bot.get_file(photo.file_id)
 
-            # Скачиваем фото в память
+            # Получаем прямой URL на файл Telegram
+            bot_token = self.application.bot.token
+            telegram_file_url = f"https://api.telegram.org/file/bot{bot_token}/{file.file_path}"
+
+            # Скачиваем фото в память для Gemini
             photo_bytes = await file.download_as_bytearray()
 
             # Добавляем фото в список
             photos.append({
                 'bytes': photo_bytes,
                 'file_id': photo.file_id,
+                'file_path': file.file_path,
+                'telegram_url': telegram_file_url,
                 'file_name': f"photo_{len(photos) + 1}.jpg"
             })
 
@@ -1175,9 +1181,13 @@ class MarketBot:
                 short_desc = product.get('name', 'Без названия')  # Изменено с short_description на name
                 quantity = product.get('quantity', 'Не указано')
                 created_at = product.get('created_at', '')
+                photo_url = product.get('photo_urls', '')
 
+                # Добавляем информацию о товаре
                 message += f"🏷️ *Товар {i}*: {short_desc}\n"
                 message += f"📊 Количество: {quantity}\n"
+                if photo_url and photo_url.strip():
+                    message += f"🖼️ Фото: {photo_url}\n"
                 if created_at:
                     message += f"📅 Добавлен: {created_at}\n"
                 message += "\n"
@@ -1543,20 +1553,17 @@ class MarketBot:
             for i, (result, quantity) in enumerate(zip(recognition_results, quantities)):
                 product_id = str(uuid.uuid4())
 
-                # Загружаем фото в Google Drive (если сервис доступен)
+                # Используем прямой URL из Telegram
                 image_urls = ""
                 try:
-                    if self.image_storage_service and i < len(uploaded_photos):
+                    if i < len(uploaded_photos):
                         photo_data = uploaded_photos[i]
-                        image_url = await self.image_storage_service.upload_image(
-                            photo_data['bytes'],
-                            photo_data['file_name'],
-                            product_id
-                        )
-                        if image_url:
-                            image_urls = image_url
+                        telegram_url = photo_data.get('telegram_url', '')
+                        if telegram_url:
+                            image_urls = telegram_url
+                            logger.info(f"Using Telegram URL for product {product_id}: {telegram_url}")
                 except Exception as e:
-                    logger.warning(f"Failed to upload image to Google Drive: {e}")
+                    logger.warning(f"Failed to get Telegram URL for image: {e}")
 
                 # Сохраняем в Google Sheets
                 success = self.sheets_manager.add_product(
