@@ -26,6 +26,15 @@ class GeminiService:
         genai.configure(api_key=GEMINI_API_KEY)
         self.model = genai.GenerativeModel(GEMINI_MODEL)
 
+        # Проверяем доступность API
+        try:
+            self.test_connection()
+        except Exception as e:
+            if "User location is not supported" in str(e):
+                raise ValueError(f"Gemini API недоступен в вашем регионе. Ошибка: {str(e)}")
+            else:
+                raise ValueError(f"Ошибка подключения к Gemini API: {str(e)}")
+
         # Настройки генерации
         self.generation_config = {
             "temperature": 0.1,
