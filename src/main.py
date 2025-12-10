@@ -1032,7 +1032,33 @@ class MarketBot:
 
             # Получаем прямой URL на файл Telegram
             bot_token = self.application.bot.token
-            telegram_file_url = f"https://api.telegram.org/file/bot{bot_token}/{file.file_path}"
+
+            # Telegram API изменился - теперь file_path может возвращать полный URL
+            # Нужно извлечь только относительный путь
+            file_path = file.file_path
+
+            logger.info(f"Original file_path: {file_path}")
+
+            # Если file_path содержит полный URL, извлекаем только путь
+            if file_path.startswith('http'):
+                # Извлекаем путь после /file/bot{token}/
+                if f'/file/bot{bot_token}/' in file_path:
+                    relative_path = file_path.split(f'/file/bot{bot_token}/')[-1]
+
+                    # Дополнительная проверка на случай дублирования URL
+                    if relative_path.startswith('http'):
+                        # Если остался дублирование, берем только последнюю часть пути
+                        relative_path = '/'.join(relative_path.split('/')[-2:])  # photos/file_X.jpg
+
+                    telegram_file_url = f"https://api.telegram.org/file/bot{bot_token}/{relative_path}"
+                else:
+                    # Если формат другой, пробуем извлечь после последнего /
+                    telegram_file_url = file_path
+            else:
+                # Если file_path только относительный путь, используем как есть
+                telegram_file_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+
+            logger.info(f"Final Telegram URL: {telegram_file_url}")
 
             # Скачиваем фото в память для Gemini
             photo_bytes = await file.download_as_bytearray()
