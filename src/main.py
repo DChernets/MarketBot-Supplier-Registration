@@ -11,6 +11,7 @@ from src.google_sheets import GoogleSheetsManager
 from src.gemini_service import get_gemini_service, initialize_gemini_service
 from src.image_storage import get_image_storage_service, initialize_image_storage
 from src.content_generation_service import get_content_generation_service
+from src.utils import escape_markdown
 
 # Создаем директорию для логов, если не существует
 import os
@@ -35,6 +36,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ВАЖНО: Отключаем логирование чувствительных данных (API ключи, токены)
+# httpx и telegram логируют полные URL с ключами на уровне INFO
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logging.getLogger('telegram.ext').setLevel(logging.WARNING)
+logger.info("⚠️ Sensitive data logging disabled for httpx, httpcore, telegram")
 
 # Состояния для ConversationHandler
 NAME, MARKET, PAVILION, PHONE, ADD_MORE_PHONES, ADD_MORE_PHONES_CALLBACK, ADD_LOCATION, ADD_LOCATION_CALLBACK = range(8)
@@ -499,6 +508,9 @@ class MarketBot:
         elif query.data.startswith('enhance_content_'):
             logger.info(f"handle_callback: calling enhance_product_content")
             await self.enhance_product_content(update, context)
+        elif query.data.startswith('view_enhanced_'):
+            logger.info(f"handle_callback: calling view_enhanced_content")
+            await self.view_enhanced_content(update, context)
         else:
             logger.warning(f"handle_callback: unknown callback data pattern: {query.data}")
 
@@ -833,7 +845,7 @@ class MarketBot:
                     [InlineKeyboardButton("📝 ИЗМЕНИТЬ ИНФОРМАЦИЮ ПОСТАВЩИКА", callback_data="edit_supplier")],
                     [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")],
                     [InlineKeyboardButton("📸 ФОТО", callback_data="photo_recognition")],
-                    [InlineKeyboardButton("📦 МОИ ТОВАРЫ", callback_data="my_products")]
+                    [InlineKeyboardButton("📦", callback_data="my_products")]
                 ])
 
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1460,6 +1472,11 @@ class MarketBot:
 
     async def show_my_products(self, update: Update, context):
         """Показать мои товары с фото"""
+        # Инициализируем переменные перед try, чтобы они были доступны в блоке except
+        user_id = None
+        supplier_id = None
+        products = []
+
         try:
             query = update.callback_query
             await query.answer()
@@ -1529,9 +1546,12 @@ class MarketBot:
                     # Проверяем описание и полное описание (улучшенное)
                     description_field = product.get('описание', product.get('description', ''))
                     full_description_field = product.get('full_description', '')
+                    enhanced_description_field = product.get('enhanced_description', '')
 
-                    # Используем улучшенное описание, если оно есть, иначе базовое
-                    if full_description_field and str(full_description_field).strip() and str(full_description_field) != 'None':
+                    # Приоритет: улучшенное описание AI > полное описание > базовое описание
+                    if enhanced_description_field and str(enhanced_description_field).strip() and str(enhanced_description_field) != 'None':
+                        description_field = str(enhanced_description_field)
+                    elif full_description_field and str(full_description_field).strip() and str(full_description_field) != 'None':
                         description_field = str(full_description_field)
                     elif description_field and str(description_field).strip() and str(description_field) != 'None':
                         description_field = str(description_field)
@@ -1578,12 +1598,23 @@ class MarketBot:
                             enhanced_local_path = None
 
                     # Формируем описание товара с новой структурой
-                    caption = f"🏷️ {product_name}\n"
-                    caption += f"📝 {short_desc}\n"
+                    caption = f"🏷️ {escape_markdown(product_name)}\n"
+
+                    # Добавляем индикаторы улучшенного контента
+                    has_enhanced_content = False
+                    if product.get('enhanced_description') and str(product.get('enhanced_description')).strip():
+                        caption += "✨ "
+                        has_enhanced_content = True
+                    caption += f"📝 {escape_markdown(short_desc)}\n"
+
                     caption += f"🆔 ID: {product_id}\n"
                     caption += f"📊 Количество: {quantity_str}\n"
                     if created_at and created_at.strip():
                         caption += f"📅 Добавлен: {created_at}\n"
+
+                    # Показываем, если есть улучшенный контент
+                    if has_enhanced_content:
+                        caption += f"🎨 *Есть улучшенный контент*\n"
 
                     # Кнопки управления для товара
                     product_buttons = []
@@ -1598,21 +1629,21 @@ class MarketBot:
                             )
                             if limit_check['allowed']:
                                 product_buttons.append(
-                                    InlineKeyboardButton(f"✨ Улучшить контент", callback_data=f"enhance_content_{product_id}")
+                                    InlineKeyboardButton(f"✨", callback_data=f"enhance_content_{product_id}")
                                 )
                             else:
                                 product_buttons.append(
-                                    InlineKeyboardButton(f"✨ Улучшить контент ({limit_check['remaining']})",
-                                                      callback_data=f"enhance_content_limit_{product_id}")
+                                    InlineKeyboardButton(f"✨", callback_data=f"enhance_content_limit_{product_id}")
                                 )
                         except Exception as e:
                             logger.warning(f"Error checking content generation limits for {product_id}: {e}")
 
-                    # Добавляем стандартные кнопки
-                    product_buttons.extend([
-                        InlineKeyboardButton(f"✏️ Редактировать", callback_data=f"edit_product_{product_id}"),
-                        InlineKeyboardButton(f"🗑️ Удалить", callback_data=f"delete_product_{product_id}")
-                    ])
+                    # Кнопка просмотра улучшенного контента удалена
+
+                    # Добавляем стандартные кнопки (только удалить)
+                    product_buttons.append(
+                        InlineKeyboardButton(f"🗑️", callback_data=f"delete_product_{product_id}")
+                    )
 
                     try:
                         product_markup = InlineKeyboardMarkup([product_buttons])
@@ -1889,7 +1920,7 @@ class MarketBot:
             # Формируем описание товара с новой структурой
             caption = f"📦 Информация о товаре\n\n"
             caption += f"🏷️ {product_name}\n"
-            caption += f"📝 {short_desc}\n"
+            caption += f"📝 {escape_markdown(short_desc)}\n"
             caption += f"🆔 ID: {product_id}\n"
             caption += f"📊 Количество: {product.get('quantity', 'Не указано')}\n"
 
@@ -1902,7 +1933,7 @@ class MarketBot:
             caption += f"💡 Для изменения товара удалите его и добавьте заново."
 
             # Кнопка возврата
-            keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
+            keyboard = [[InlineKeyboardButton("⬅️", callback_data="my_products")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             # Проверяем наличие фото
@@ -1977,16 +2008,24 @@ class MarketBot:
             success = self.sheets_manager.delete_product(product_id)
 
             if success:
-                await query.edit_message_text(
+                await self.safe_edit_message_text(
+                    query,
                     "✅ Товар успешно удален.\n\n"
                     "Используйте /profile для просмотра обновленного списка.",
                     parse_mode='Markdown'
                 )
             else:
-                await query.edit_message_text("❌ Не удалось удалить товар")
+                await self.safe_edit_message_text(query, "❌ Не удалось удалить товар")
 
         except Exception as e:
             logger.error(f"Error in delete_product: {e}")
+            try:
+                # Если не удалось отредактировать сообщение, отправляем новое
+                await query.message.reply_text(
+                    "❌ Произошла ошибка при удалении товара. Попробуйте позже."
+                )
+            except Exception as e2:
+                logger.error(f"Failed to send error message: {e2}")
 
     async def handle_photo_upload_text(self, update: Update, context):
         """Обработка текстовых сообщений при загрузке фото"""
@@ -2112,7 +2151,7 @@ class MarketBot:
 
                 # Создаем клавиатуру с кнопками управления
                 keyboard = [
-                    [InlineKeyboardButton("📦 МОИ ТОВАРЫ", callback_data="my_products")],
+                    [InlineKeyboardButton("📦", callback_data="my_products")],
                     [InlineKeyboardButton("📍 МОИ ЛОКАЦИИ", callback_data="my_locations")],
                     [InlineKeyboardButton("📸 ФОТО", callback_data="photo_recognition")]
                 ]
@@ -2417,10 +2456,10 @@ class MarketBot:
             enhanced_description = enhanced_product.get('enhanced_description')
 
             caption = f"🎨 *Пример улучшенного товара*\n\n"
-            caption += f"🏷️ {product_name}\n"
+            caption += f"🏷️ {escape_markdown(product_name)}\n"
 
             if enhanced_description:
-                caption += f"📝 *Новое B2B описание:*\n{enhanced_description}\n"
+                caption += f"📝 *Новое B2B описание:*\n{escape_markdown(enhanced_description)}\n"
 
             caption += f"\n💡 Чтобы управлять контентом для всех товаров, используйте /my_products"
 
@@ -2588,14 +2627,17 @@ class MarketBot:
             # Если есть улучшенное изображение - загружаем в Google Drive
             enhanced_image_path = None
             enhanced_image_url_for_sheets = None
+            is_enhanced_original = result.get('enhanced_original', False)
+            filename_for_local = None  # Сохраняем имя файла для локального пути
 
-            if 'enhanced_image_bytes' in result and result['enhanced_image_bytes']:
+            if 'enhanced_image_bytes' in result and result['enhanced_image_bytes'] and not is_enhanced_original:
                 try:
                     from datetime import datetime
                     import os
 
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"enhanced_{product_id}_{timestamp}.jpg"
+                    filename_for_local = filename  # Сохраняем для использования вне блока try
 
                     # 1. Загружаем в Google Drive (основное хранилище)
                     if self.image_storage_service:
@@ -2625,19 +2667,57 @@ class MarketBot:
                 except Exception as e:
                     logger.error(f"Failed to save enhanced image: {e}")
 
+            # Обработка оригинального изображения (если улучшение не удалось)
+            if 'enhanced_image_bytes' in result and result['enhanced_image_bytes'] and is_enhanced_original:
+                try:
+                    # Сохраняем оригинальное изображение локально
+                    from datetime import datetime
+                    import os
+
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"original_{product_id}_{timestamp}.jpg"
+                    filename_for_local = filename  # Сохраняем для использования вне блока try
+
+                    local_dir = "/root/myAI/MarketBot/enhanced_images"
+                    os.makedirs(local_dir, exist_ok=True)
+
+                    enhanced_image_path = os.path.join(local_dir, filename)
+                    with open(enhanced_image_path, 'wb') as f:
+                        f.write(result['enhanced_image_bytes'])
+
+                    logger.info(f"✅ Original image saved locally: {enhanced_image_path}")
+                    result['enhanced_image_path'] = enhanced_image_path
+                    result['enhanced_original'] = True
+
+                except Exception as e:
+                    logger.error(f"Failed to save original image: {e}")
+
             # Сохраняем улучшенный контент (изображение + описание) в Google Sheets ОДИН РАЗ
             try:
                 from datetime import datetime
 
                 generated_description = result.get('generated_description')
+                marketing_text = result.get('marketing_text')
+
+                # Подготавливаем URL для сохранения
+                final_image_url = enhanced_image_url_for_sheets
+
+                # Если загрузка в Google Drive не удалась, но есть локальный файл
+                if not final_image_url and enhanced_image_path and filename_for_local:
+                    final_image_url = f"local:{filename_for_local}"
+                # Если это оригинальное изображение (fallback)
+                elif is_enhanced_original and enhanced_image_path and filename_for_local:
+                    final_image_url = f"local:{filename_for_local}"
 
                 # Обновляем только если есть что сохранять
-                if enhanced_image_url_for_sheets or generated_description:
+                if final_image_url or generated_description or marketing_text:
                     logger.info(f"Сохраняем улучшенный контент для товара {product_id}")
+                    logger.info(f"Final image URL: {final_image_url}")
                     self.sheets_manager.update_product_enhanced_content(
                         product_id=product_id,
-                        enhanced_image_url=enhanced_image_url_for_sheets,
+                        enhanced_image_url=final_image_url,
                         enhanced_description=generated_description,
+                        marketing_text=marketing_text,
                         content_generated_at=datetime.now().isoformat()
                     )
                     # Принудительно инвалидируем кеш чтобы изменения были видны сразу
@@ -2691,7 +2771,7 @@ class MarketBot:
             message += f"💡 Вы можете улучшать контент других товаров\n"
             message += f"или подождать до следующего обновления лимитов."
 
-            keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
+            keyboard = [[InlineKeyboardButton("⬅️", callback_data="my_products")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             await self.safe_edit_message_text(
@@ -2711,6 +2791,163 @@ class MarketBot:
                     await query.message.reply_text("❌ Ошибка при загрузке информации")
                 except Exception as e3:
                     logger.error(f"Failed to send error message: {e3}")
+
+    async def view_enhanced_content(self, update: Update, context):
+        """Просмотр улучшенного контента товара"""
+        try:
+            query = update.callback_query
+            await query.answer()
+
+            # Извлекаем ID товара
+            product_id = query.data.replace('view_enhanced_', '')
+            user_id = query.from_user.id
+
+            logger.info(f"Просмотр улучшенного контента для товара {product_id}")
+
+            # Получаем информацию о поставщике
+            supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
+            if not supplier:
+                await self.safe_edit_message_text(
+                    query,
+                    "❌ Доступ запрещен. Вы не зарегистрированы."
+                )
+                return
+
+            supplier_id = supplier['internal_id']
+
+            # Получаем информацию о товаре
+            products = self.sheets_manager.get_products_by_supplier_id(supplier_id)
+            product = None
+            for p in products:
+                if str(p.get('product_id')) == str(product_id):
+                    product = p
+                    break
+
+            if not product:
+                await self.safe_edit_message_text(
+                    query,
+                    "❌ Товар не найден"
+                )
+                return
+
+            product_name = product.get('название', 'Товар')
+
+            # Проверяем наличие улучшенного контента
+            enhanced_description = product.get('enhanced_description', '')
+            enhanced_image_url = product.get('enhanced_image_url', '')
+            content_generated_at = product.get('content_generated_at', '')
+            content_version = product.get('content_version', '1')
+
+            if not enhanced_description and not enhanced_image_url:
+                await self.safe_edit_message_text(
+                    query,
+                    f"🏷️ {escape_markdown(product_name)}\n\n"
+                    "❌ Улучшенный контент не найден\n\n"
+                    "Используйте кнопку '✨ Улучшить контент' для генерации",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")
+                    ]])
+                )
+                return
+
+            # Формируем сообщение
+            message = f"🎨 *Улучшенный контент*\n\n"
+            message += f"🏷️ {escape_markdown(product_name)}\n"
+            message += f"🆔 ID: {product_id}\n\n"
+
+            if enhanced_description:
+                message += f"📝 *Улучшенное описание:*\n{escape_markdown(enhanced_description)}\n\n"
+
+            if content_generated_at:
+                from datetime import datetime
+                try:
+                    # Форматируем дату
+                    dt = datetime.fromisoformat(content_generated_at.replace('Z', '+00:00'))
+                    message += f"📅 Сгенерирован: {dt.strftime('%d.%m.%Y %H:%M')}\n"
+                except:
+                    message += f"📅 Сгенерирован: {content_generated_at}\n"
+
+            if content_version and content_version != '1':
+                message += f"🔄 Версия контента: {content_version}\n"
+
+            keyboard = [[InlineKeyboardButton("⬅️", callback_data="my_products")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Проверяем локальное улучшенное изображение
+            enhanced_local_path = None
+            if enhanced_image_url and str(enhanced_image_url).startswith('local:'):
+                # Извлекаем имя файла из "local:filename"
+                filename = str(enhanced_image_url).replace('local:', '')
+                enhanced_local_path = f"/root/myAI/MarketBot/enhanced_images/{filename}"
+                # Проверяем существование файла
+                import os
+                if not os.path.exists(enhanced_local_path):
+                    logger.warning(f"Enhanced image file not found: {enhanced_local_path}")
+                    enhanced_local_path = None
+
+            # Отправляем сообщение
+            if enhanced_local_path:
+                # Сначала редактируем текущее сообщение
+                await self.safe_edit_message_text(
+                    query,
+                    message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+                # Затем отправляем изображение
+                with open(enhanced_local_path, 'rb') as photo_file:
+                    await query.message.reply_photo(
+                        photo=photo_file,
+                        caption=f"🎨 *Улучшенное изображение для {escape_markdown(product_name)}*\n\n"
+                                f"✨ Профессиональная обработка через Gemini 2.5 Flash Image",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")
+                        ]]),
+                        parse_mode='Markdown'
+                    )
+                logger.info(f"Enhanced image sent for viewing: {enhanced_local_path}")
+
+            elif enhanced_image_url and not str(enhanced_image_url).startswith('local:'):
+                # Отправляем изображение по URL
+                success = await self.send_photo_from_telegram_url(
+                    chat_id=user_id,
+                    photo_url=str(enhanced_image_url),
+                    caption=message + f"\n\n🎨 *Улучшенное изображение*",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+                if not success:
+                    # Если не удалось отправить фото, отправляем только текст
+                    message += f"\n\n🖼️ [Улучшенное изображение]({enhanced_image_url})"
+                    await self.safe_edit_message_text(
+                        query,
+                        message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+            else:
+                # Только текст
+                await self.safe_edit_message_text(
+                    query,
+                    message,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error in view_enhanced_content: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            try:
+                query = update.callback_query
+                await self.safe_edit_message_text(
+                    query,
+                    "❌ Произошла ошибка при загрузке контента. Попробуйте позже."
+                )
+            except Exception as e2:
+                logger.error(f"Failed to show error message: {e2}")
 
     async def show_enhanced_content_result(self, update: Update, original_product: dict, result: dict):
         """Показать результат улучшения контента"""
@@ -2733,7 +2970,7 @@ class MarketBot:
                 error_message += f"🔸 Контент не был сгенерирован\n\n"
                 error_message += f"Попробуйте позже или обратитесь в поддержку."
 
-                keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
+                keyboard = [[InlineKeyboardButton("⬅️", callback_data="my_products")]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
                 await self.safe_edit_message_text(
@@ -2746,7 +2983,7 @@ class MarketBot:
 
             # Формируем сообщение об успешном улучшении
             success_message = f"✅ *Контент успешно улучшен!*\n\n"
-            success_message += f"🏷️ {product_name}\n"
+            success_message += f"🏷️ {escape_markdown(product_name)}\n"
 
             # Используем правильные поля из результата
             enhanced_image_url = result.get('enhanced_image_url')
@@ -2822,7 +3059,7 @@ class MarketBot:
                         from io import BytesIO
                         await query.message.reply_photo(
                             photo=BytesIO(enhanced_image_bytes),
-                            caption=f"🎨 *Улучшенное изображение для {product_name}*\n\n"
+                            caption=f"🎨 *Улучшенное изображение для {escape_markdown(product_name)}*\n\n"
                                     f"✨ Профессиональная обработка через Gemini 2.5 Flash Image\n"
                                     f"📸 Студийное освещение и композиция для B2B продаж",
                             reply_markup=reply_markup,
@@ -2834,7 +3071,7 @@ class MarketBot:
                         with open(enhanced_image_path, 'rb') as photo_file:
                             await query.message.reply_photo(
                                 photo=photo_file,
-                                caption=f"🎨 *Улучшенное изображение для {product_name}*\n\n"
+                                caption=f"🎨 *Улучшенное изображение для {escape_markdown(product_name)}*\n\n"
                                         f"✨ Профессиональная обработка через Gemini 2.5 Flash Image\n"
                                         f"📸 Студийное освещение и композиция для B2B продаж",
                                 reply_markup=reply_markup,
