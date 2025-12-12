@@ -7,14 +7,23 @@ import asyncio
 import io
 import logging
 import base64
+import json
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
-import google.generativeai as genai
+import httpx
+from PIL import Image
 
-from src.config import GEMINI_API_KEY, GEMINI_MODEL
+from src.config import GEMINI_API_KEY, GEMINI_RECOGNITION_MODEL, GEMINI_CONTENT_GENERATION_MODEL, USE_PROXY, HTTP_PROXY, HTTPS_PROXY
 from src.usage_limits import get_usage_limits
 
 logger = logging.getLogger(__name__)
+
+# Gemini API endpoints
+def get_recognition_endpoint():
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_RECOGNITION_MODEL}:generateContent"
+
+def get_content_generation_endpoint():
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CONTENT_GENERATION_MODEL}:generateContent"
 
 class ContentGenerationService:
     """Класс для генерации контента товаров"""
@@ -23,17 +32,130 @@ class ContentGenerationService:
         """Инициализация сервиса генерации контента"""
         self.sheets_manager = sheets_manager
         self.usage_limits = get_usage_limits(sheets_manager)
+        self.api_key = GEMINI_API_KEY
+        self.timeout = 60.0  # 60 секунд таймаут для генерации изображений
+        self.max_retries = 3
 
-        # Конфигурация Gemini API
-        genai.configure(api_key=GEMINI_API_KEY)
+        # Настройки генерации текста
+        self.text_generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 40,
+            "max_output_tokens": 2048,
+        }
 
-        # Модель для генерации текста
-        self.text_model = genai.GenerativeModel(GEMINI_MODEL)
+        # Настройки генерации изображений
+        self.image_generation_config = {
+            "temperature": 0.8,
+            "candidate_count": 1,
+        }
 
-        # Модель для генерации изображений
-        self.image_model = genai.GenerativeModel("gemini-2.5-flash-image")
+        logger.info("Сервис генерации контента инициализирован с Gemini Vision HTTP API")
 
-        logger.info("Сервис генерации контента инициализирован с Gemini Vision")
+    async def call_gemini_api(self, text: str, image_bytes: Optional[bytes] = None, image_mime: Optional[str] = None, generation_config: Optional[Dict] = None, use_image_model: bool = False) -> Dict[str, Any]:
+        """Вызов Gemini API через HTTP"""
+        if generation_config is None:
+            generation_config = self.text_generation_config
+
+        # Создаем содержимое запроса
+        parts = [{"text": text}]
+
+        if image_bytes and image_mime:
+            # Кодируем изображение в base64
+            encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+            parts.append({
+                "inlineData": {
+                    "mimeType": image_mime,
+                    "data": encoded_image,
+                }
+            })
+
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": generation_config,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        params = {"key": self.api_key}
+
+        # Выбираем правильный эндпоинт
+        if use_image_model and image_bytes:
+            endpoint = get_content_generation_endpoint()
+            model_name = GEMINI_CONTENT_GENERATION_MODEL
+        else:
+            endpoint = get_recognition_endpoint()
+            model_name = GEMINI_RECOGNITION_MODEL
+
+        # Настраиваем прокси
+        proxies = {}
+        if USE_PROXY:
+            if HTTP_PROXY:
+                proxies["http://"] = HTTP_PROXY
+            if HTTPS_PROXY:
+                proxies["https://"] = HTTPS_PROXY
+
+        # Логируем использование прокси
+        if USE_PROXY and proxies:
+            logger.info(f"Используем прокси для генерации контента: {proxies}")
+        elif not USE_PROXY:
+            logger.info("Прокси отключен для генерации контента")
+        else:
+            logger.info("Прокси не настроен для генерации контента")
+
+        logger.info(f"Используем модель: {model_name}")
+
+        last_error = None
+
+        async with httpx.AsyncClient(timeout=self.timeout, proxies=proxies if proxies else None) as client:
+            for attempt in range(self.max_retries):
+                try:
+                    logger.info(f"Попытка вызова Gemini API для генерации контента {attempt + 1}/{self.max_retries}")
+
+                    response = await client.post(
+                        endpoint,
+                        params=params,
+                        headers=headers,
+                        json=payload
+                    )
+
+                    # Retry на 503 (service unavailable) или 429 (rate limit)
+                    if response.status_code in (503, 429):
+                        if attempt < self.max_retries - 1:
+                            wait_time = 2 ** attempt  # Exponential backoff
+                            logger.warning(f"Gemini API вернул {response.status_code} при генерации. Повторная попытка через {wait_time}с (попытка {attempt + 1}/{self.max_retries})")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            response.raise_for_status()
+
+                    response.raise_for_status()
+                    return response.json()
+
+                except httpx.HTTPStatusError as e:
+                    last_error = e
+                    # Retry на 503 или 429 если есть попытки
+                    if e.response.status_code in (503, 429) and attempt < self.max_retries - 1:
+                        wait_time = 2 ** attempt
+                        error_text = e.response.text[:200] if e.response.text else "No response text"
+                        logger.warning(f"Gemini API ошибка {e.response.status_code} при генерации: {error_text}. Повтор через {wait_time}с (попытка {attempt + 1}/{self.max_retries})")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise
+
+                except Exception as e:
+                    last_error = e
+                    if attempt < self.max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.warning(f"Gemini API исключение при генерации: {type(e).__name__}: {str(e)}. Повтор через {wait_time}с (попытка {attempt + 1}/{self.max_retries})")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise
+
+        # Если все попытки неудачны
+        if last_error:
+            logger.error(f"Gemini API не ответил после {self.max_retries} попыток при генерации. Последняя ошибка: {last_error}")
+            raise last_error
+        raise RuntimeError("Failed to call Gemini API after retries")
 
     async def generate_enhanced_image(self, product_image_bytes: bytes,
                                        product_info: Dict[str, Any],
@@ -55,42 +177,29 @@ class ContentGenerationService:
             # Создаем промпт на основе типа фона и информации о товаре
             prompt = self._create_image_generation_prompt(product_info, background_type)
 
-            # Кодируем изображение в base64
-            base64_image = base64.b64encode(product_image_bytes).decode('utf-8')
+            # Подготавливаем изображение
+            optimized_image_bytes, image_mime = self._prepare_image_for_api(product_image_bytes)
 
-            # Создаем контент для Gemini
-            content = [
-                {
-                    "inline_data": {
-                        "mime_type": "image/jpeg",
-                        "data": base64_image
-                    }
-                },
-                {
-                    "text": prompt
-                }
-            ]
-
-            # Генерируем изображение через Gemini Vision
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.image_model.generate_content(
-                    content,
-                    generation_config={
-                        "temperature": 0.8,
-                        "candidate_count": 1,
-                    }
-                )
+            # Вызываем API для генерации изображения
+            response_json = await self.call_gemini_api(
+                prompt,
+                optimized_image_bytes,
+                image_mime,
+                self.image_generation_config,
+                use_image_model=True
             )
 
-            # Извлекаем сгенерированное изображение
-            if response and response.candidates:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'inline_data') and part.inline_data:
-                        # Получаем байты изображения
-                        enhanced_bytes = part.inline_data.data
-                        logger.info(f"Успешно сгенерировано изображение через Gemini Vision")
-                        return enhanced_bytes
+            # Обрабатываем ответ
+            if 'candidates' in response_json and response_json['candidates']:
+                candidate = response_json['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    for part in candidate['content']['parts']:
+                        if 'inlineData' in part and part['inlineData']:
+                            # Получаем байты изображения
+                            if 'data' in part['inlineData']:
+                                enhanced_bytes = base64.b64decode(part['inlineData']['data'])
+                                logger.info(f"Успешно сгенерировано изображение через Gemini Vision")
+                                return enhanced_bytes
 
             logger.warning("Gemini Vision не вернул изображение")
             return None
@@ -99,9 +208,9 @@ class ContentGenerationService:
             logger.error(f"Ошибка при генерации изображения через Gemini Vision: {e}")
             return None
 
-    async def generate_b2b_description(self, product_info: Dict[str, Any]) -> Optional[str]:
+    async def generate_product_description(self, product_info: Dict[str, Any]) -> Optional[str]:
         """
-        Сгенерировать B2B описание товара
+        Сгенерировать профессиональное описание товара
 
         Args:
             product_info: Информация о товаре
@@ -110,478 +219,319 @@ class ContentGenerationService:
             str: Сгенерированное описание или None при ошибке
         """
         try:
-            logger.info(f"Начало генерации B2B описания для товара")
+            logger.info("Начало генерации описания товара")
 
-            # Создаем промпт для генерации B2B описания
-            prompt = self._create_b2b_description_prompt(product_info)
+            prompt = self._create_description_prompt(product_info)
 
-            # Генерируем описание
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.text_model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.7,
-                        "top_p": 0.9,
-                        "top_k": 40,
-                        "max_output_tokens": 300,
-                    }
-                )
-            )
+            # Вызываем API для генерации текста
+            response_json = await self.call_gemini_api(prompt)
 
-            if response and response.text:
-                description = response.text.strip()
-                logger.info(f"Успешно сгенерировано B2B описание")
-                return description
-            else:
-                logger.warning("Пустой ответ от Gemini API при генерации описания")
-                return None
+            # Обрабатываем ответ
+            if 'candidates' in response_json and response_json['candidates']:
+                candidate = response_json['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    part = candidate['content']['parts'][0]
+                    if 'text' in part:
+                        description = part['text'].strip()
+                        logger.info(f"Успешно сгенерировано описание товара")
+                        return description
 
-        except Exception as e:
-            logger.error(f"Ошибка при генерации B2B описания: {e}")
-            return None
-
-    async def generate_content_variations(self, product_info: Dict[str, Any],
-                                         count: int = 3) -> List[str]:
-        """
-        Сгенерировать несколько вариантов описания товара
-
-        Args:
-            product_info: Информация о товаре
-            count: Количество вариантов
-
-        Returns:
-            List[str]: Список сгенерированных описаний
-        """
-        try:
-            logger.info(f"Генерация {count} вариантов описания для товара")
-
-            descriptions = []
-            for i in range(count):
-                prompt = self._create_b2b_description_prompt(product_info, variation=i+1)
-
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.text_model.generate_content(
-                        prompt,
-                        generation_config={
-                            "temperature": 0.8 + (i * 0.1),  # Разная температура для разнообразия
-                            "top_p": 0.9,
-                            "top_k": 40,
-                            "max_output_tokens": 250,
-                        }
-                    )
-                )
-
-                if response and response.text:
-                    description = response.text.strip()
-                    descriptions.append(description)
-                    logger.info(f"Вариант {i+1} успешно сгенерирован")
-
-            return descriptions
-
-        except Exception as e:
-            logger.error(f"Ошибка при генерации вариантов описания: {e}")
-            return []
-
-    async def enhance_product_content(self, user_id: int, product_info: Dict[str, Any],
-                                        image_bytes: Optional[bytes] = None) -> Dict[str, Any]:
-        """
-        Улучшить контент товара (генерация изображения и описания)
-
-        Args:
-            user_id: ID пользователя
-            product_info: Информация о товаре
-            image_bytes: Байты изображения (опционально)
-
-        Returns:
-            Dict: Результат улучшения контента
-        """
-        try:
-            product_id = product_info.get('product_id')
-            if not product_id:
-                return {'success': False, 'error': 'ID товара не указан'}
-
-            # Проверяем лимиты
-            limit_check = self.usage_limits.check_daily_limit(user_id, product_id, 'content_enhancement')
-            if not limit_check['allowed']:
-                return {
-                    'success': False,
-                    'error': limit_check['message'],
-                    'remaining': limit_check['remaining'],
-                    'next_reset': limit_check['next_reset']
-                }
-
-            logger.info(f"Начало улучшения контента для товара {product_id}")
-
-            # Записываем попытку использования
-            self.usage_limits.record_usage(user_id, product_id, 'content_enhancement', success=True)
-
-            result = {
-                'success': True,
-                'enhanced_image_url': None,
-                'enhanced_description': None,
-                'variations': [],
-                'generated_at': datetime.now().isoformat(),
-                'background_used': None
-            }
-
-            # Выбираем тип профессионального фона для Gemini Vision
-            background_types = ["professional_studio", "clean_white_background", "marketing_showcase", "minimalist_display"]
-            selected_background = "professional_studio"  # По умолчанию
-            result['background_used'] = selected_background
-
-            # Генерируем улучшенное изображение через Gemini Vision
-            if image_bytes:
-                enhanced_image_bytes = await self.generate_enhanced_image(
-                    image_bytes, product_info, selected_background
-                )
-
-                if enhanced_image_bytes:
-                    # Загружаем изображение в Google Drive
-                    if self.sheets_manager:
-                        try:
-                            from src.image_storage import ImageStorageService
-                            storage_service = ImageStorageService()
-
-                            # Сохраняем улучшенное изображение
-                            image_filename = f"enhanced_{product_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                            image_url = storage_service.upload_image_bytes(
-                                enhanced_image_bytes,
-                                image_filename,
-                                f"Enhanced product image for {product_info.get('название', 'Unknown')}"
-                            )
-
-                            result['enhanced_image_url'] = image_url
-                            logger.info(f"Улучшенное изображение загружено: {image_url}")
-
-                        except Exception as e:
-                            logger.error(f"Ошибка при загрузке улучшенного изображения: {e}")
-
-            # Генерируем B2B описание
-            enhanced_description = await self.generate_b2b_description(product_info)
-            if enhanced_description:
-                result['enhanced_description'] = enhanced_description
-                logger.info(f"Сгенерировано улучшенное описание для товара {product_id}")
-
-            # Генерируем вариации описания
-            variations = await self.generate_content_variations(product_info, 3)
-            result['variations'] = variations
-
-            if result['enhanced_image_url'] or result['enhanced_description']:
-                # Обновляем информацию в Google Sheets
-                if self.sheets_manager:
-                    self.sheets_manager.update_product_enhanced_content(
-                        product_id,
-                        result['enhanced_image_url'],
-                        result['enhanced_description'],
-                        result['generated_at']
-                    )
-
-                logger.info(f"Успешно улучшен контент для товара {product_id}")
-                return result
-            else:
-                # Откатываем запись использования если ничего не сгенерировалось
-                self.usage_limits.record_usage(
-                    user_id, product_id, 'content_enhancement',
-                    success=False,
-                    error_message="Не удалось сгенерировать ни изображение ни описание"
-                )
-
-                return {
-                    'success': False,
-                    'error': 'Не удалось сгенерировать контент. Попробуйте позже.'
-                }
-
-        except Exception as e:
-            logger.error(f"Ошибка при улучшении контента: {e}")
-            # Откатываем запись использования при ошибке
-            try:
-                self.usage_limits.record_usage(
-                    user_id, product_info.get('product_id', ''),
-                    'content_enhancement',
-                    success=False,
-                    error_message=str(e)
-                )
-            except:
-                pass
-
-            return {
-                'success': False,
-                'error': 'Произошла ошибка при генерации контента. Попробуйте позже.'
-            }
-
-    def _create_b2b_description_prompt(self, product_info: Dict[str, Any], variation: int = 1) -> str:
-        """
-        Создать промпт для генерации B2B описания
-
-        Args:
-            product_info: Информация о товаре
-            variation: Номер вариации для разнообразия
-
-        Returns:
-            str: Промпт для Gemini API
-        """
-        product_name = product_info.get('название', 'Товар')
-        description = product_info.get('описание', '')
-        material = product_info.get('материал', '')
-        production = product_info.get('производство', '')
-        dimensions = product_info.get('размеры', '')
-        packaging = product_info.get('упаковка', '')
-
-        # Базовый промпт
-        base_prompt = f"""
-Создай убедительное B2B описание для оптовых продаж товара:
-
-ТОВАР: {product_name}
-Характеристики:
-- Описание: {description}
-- Материал: {material}
-- Производство: {production}
-- Размеры: {dimensions}
-- Упаковка: {packaging}
-
-ТРЕБОВАНИЯ:
-1. Целевая аудитория: владельцы магазинов, оптовые покупатели, менеджеры по закупкам
-2. Фокус на выгоде для бизнеса и перепродажи
-3. Краткость: 2-3 предложения максимум
-4. Профессиональный и убедительный тон
-5. Упомяни ключевые преимущества для опта
-6. Добавь легкий призыв к действию
-
-ВАРИАНТ {variation}: Сделай описание уникальным, измени формулировки и акценты.
-"""
-
-        # Добавляем специфику для разных вариаций
-        if variation == 1:
-            base_prompt += """
-АКЦЕНТ на качестве и надежности для долгосрочного сотрудничества."""
-        elif variation == 2:
-            base_prompt += """
-АКЦЕНТ на сезонности и трендах, подчеркивая актуальность."""
-        elif variation == 3:
-            base_prompt += """
-АКЦЕНТ на маржинальности и выгоде для перепродажи, используя бизнес-терминологию."""
-
-        base_prompt += """
-
-Отвечай только готовым описанием без дополнительных комментариев."""
-        return base_prompt
-
-    async def generate_product_showcase_description(self, product_info: Dict[str, Any]) -> Optional[str]:
-        """
-        Сгенерировать описание для витрины/шоукейса
-
-        Args:
-            product_info: Информация о товаре
-
-        Returns:
-            str: Описание для витрины
-        """
-        try:
-            product_name = product_info.get('название', 'Товар')
-            description = product_info.get('описание', '')
-            price_info = product_info.get('цена', 'конкурентная цена')
-
-            prompt = f"""
-Создай привлекательное описание для витрины/шоукейса товара:
-
-ТОВАР: {product_name}
-Описание: {description}
-Ценовая позиция: {price_info}
-
-ТРЕБОВАНИЯ:
-1. Краткое и яркое описание (1-2 предложения)
-2. Фокус на визуальной привлекательности и выгоде для конечного покупателя
-3. Эмоциональный язык для привлечения внимания
-4. Подчеркни ключевые преимущества товара
-5. Используй маркетинговые триггеры
-
-Стиль: яркий, убедительный, привлекающий внимание.
-
-Отвечай только готовым описанием."""
-
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.text_model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.8,
-                        "max_output_tokens": 200,
-                    }
-                )
-            )
-
-            if response and response.text:
-                return response.text.strip()
+            logger.warning("Не удалось сгенерировать описание товара")
             return None
 
         except Exception as e:
-            logger.error(f"Ошибка при генерации описания для витрины: {e}")
+            logger.error(f"Ошибка при генерации описания товара: {e}")
             return None
+
+    async def generate_marketing_text(self, product_info: Dict[str, Any]) -> Optional[str]:
+        """
+        Сгенерировать маркетинговый текст для товара
+
+        Args:
+            product_info: Информация о товаре
+
+        Returns:
+            str: Сгенерированный маркетинговый текст или None при ошибке
+        """
+        try:
+            logger.info("Начало генерации маркетингового текста")
+
+            prompt = self._create_marketing_prompt(product_info)
+
+            # Вызываем API для генерации текста
+            response_json = await self.call_gemini_api(prompt)
+
+            # Обрабатываем ответ
+            if 'candidates' in response_json and response_json['candidates']:
+                candidate = response_json['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    part = candidate['content']['parts'][0]
+                    if 'text' in part:
+                        marketing_text = part['text'].strip()
+                        logger.info(f"Успешно сгенерирован маркетинговый текст")
+                        return marketing_text
+
+            logger.warning("Не удалось сгенерировать маркетинговый текст")
+            return None
+
+        except Exception as e:
+            logger.error(f"Ошибка при генерации маркетингового текста: {e}")
+            return None
+
+    def _prepare_image_for_api(self, image_bytes: bytes) -> tuple[bytes, str]:
+        """Подготовка изображения для API"""
+        try:
+            # Конвертируем байты в PIL Image
+            image = Image.open(io.BytesIO(image_bytes))
+
+            # Конвертируем в RGB если необходимо
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+
+            # Оптимизируем размер если необходимо (максимум 3MB для генерации)
+            max_size = (1024, 1024)
+            if image.size[0] > max_size[0] or image.size[1] > max_size[1]:
+                image.thumbnail(max_size, Image.Resampling.LANCZOS)
+
+            # Сохраняем в байты
+            buffer = io.BytesIO()
+            image.save(buffer, format='JPEG', quality=80)
+            optimized_bytes = buffer.getvalue()
+            buffer.close()
+
+            return optimized_bytes, "image/jpeg"
+        except Exception as e:
+            logger.error(f"Ошибка при подготовке изображения: {e}")
+            raise ValueError(f"Не удалось обработать изображение: {e}")
 
     def _create_image_generation_prompt(self, product_info: Dict[str, Any], background_type: str) -> str:
+        """Создать промпт для генерации изображения"""
+
+        base_prompt = f"""
+        Ты - профессиональный фотограф товаров и дизайнер. Создай улучшенное изображение товара для маркетинга.
+
+        Информация о товаре:
+        - Название: {product_info.get('название', 'Неизвестный товар')}
+        - Описание: {product_info.get('описание', 'Нет описания')}
+        - Материал: {product_info.get('материал', 'Не указано')}
+        - Размеры: {product_info.get('размеры', 'Не указано')}
+        - Производство: {product_info.get('производство', 'Не указано')}
         """
-        Создать промпт для генерации изображения через Gemini Vision
 
-        Args:
-            product_info: Информация о товаре
-            background_type: Тип фона
-
-        Returns:
-            str: Промпт для генерации изображения
-        """
-        product_name = product_info.get('название', 'товар')
-        description = product_info.get('описание', '')
-
-        # Базовые инструкции для B2B качества
-        base_instructions = """
-Создай профессиональное рекламное изображение для B2B продаж товара.
-ТОВАР ДОЛЕН ЗАНИМАТЬ НЕ МЕНЕЕ 60% ПЛОЩАДИ ИЗОБРАЖЕНИЯ.
-"""
-
-        # Промпты для разных типов фонов
         background_prompts = {
-            "professional_studio": f"""
-{base_instructions}
-Размести этот товар {product_name} в профессиональной фотостудии с чистым белым фоном.
-Добавь мягкое студийное освещение, которое подчеркивает детали товара.
-Изображение должно быть идеальным для B2B каталогов и оптовых заказов.
-Описание товара: {description}
-""",
-            "clean_white_background": f"""
-{base_instructions}
-Покажи товар {product_name} на идеально чистом белом фоне.
-Используй равномерное освещение без теней.
-Максимальная детализация для технических характеристик.
-Описание товара: {description}
-""",
-            "marketing_showcase": f"""
-{base_instructions}
-Размести товар {product_name} в маркетинговой витрине с элегантным светло-серым фоном.
-Добавь легкие блики и профессиональные акценты.
-Сделай изображение привлекательным для оптовых покупателей.
-Описание товара: {description}
-""",
-            "minimalist_display": f"""
-{base_instructions}
-Покажи товар {product_name} в минималистичном стиле на нейтральном фоне.
-Используй современное освещение и чистую композицию.
-Идеально для B2B презентаций и каталогов.
-Описание товара: {description}
-"""
+            "professional_studio": """
+            Тип фона: Профессиональная студия
+            Создай изображение в стиле профессиональной предметной фотографии с чистым, светлым фоном.
+            Хорошие освещение, минимальные тени, фокус на качестве товара.
+            """,
+
+            "marketing_showcase": """
+            Тип фона: Маркетинговая витрина
+            Создай привлекательное изображение товара на маркетинговом фоне.
+            Используй мягкое освещение, эстетичную композицию, возможно с элементами декора.
+            """,
+
+            "lifestyle_context": """
+            Тип фона: Lifestyle контекст
+            Размести товар в реальном контексте использования.
+            Создай атмосферу, показывающую как товар выглядит в быту или работе.
+            """,
+
+            "minimalist": """
+            Тип фона: Минимализм
+            Создай минималистичное изображение с фокусом на форме и текстуре товара.
+            Используй нейтральный фон, чистые линии, акцент на деталях.
+            """
         }
 
-        # Получаем промпт для указанного типа фона
-        prompt = background_prompts.get(background_type, background_prompts["professional_studio"])
+        background_prompt = background_prompts.get(background_type, background_prompts["professional_studio"])
 
-        # Добавляем общие требования к качеству
-        prompt += """
-РЕЖИМ: Генерация изображения (не только текст)
-КАЧЕСТВО: Высокое разрешение, профессиональная обработка
-ЦЕЛЕВАЯ АУДИТОРИЯ: B2B, оптовые покупатели, бизнес-клиенты
-ФОРМАТ: Квадратное или прямоугольное изображение
-СТИЛЬ: Чистый, профессиональный, коммерческий
+        full_prompt = f"""
+        {base_prompt}
 
-Отвечай только сгенерированным изображением без лишнего текста.
-"""
+        {background_prompt}
+
+        Требования:
+        1. Сохрани узнаваемость оригинального товара
+        2. Улуччи качество изображения, освещение и композицию
+        3. Создай профессиональный вид, подходящий для маркетинга
+        4. В результате должно получиться улучшенное изображение товара
+        """
+
+        return full_prompt
+
+    def _create_description_prompt(self, product_info: Dict[str, Any]) -> str:
+        """Создать промпт для генерации описания товара"""
+
+        prompt = f"""
+        Ты - копирайтер для B2B маркетплейса. Напиши профессиональное описание товара для оптовых покупателей.
+
+        Информация о товаре:
+        - Название: {product_info.get('название', 'Неизвестный товар')}
+        - Описание: {product_info.get('описание', 'Нет описания')}
+        - Материал: {product_info.get('материал', 'Не указано')}
+        - Размеры: {product_info.get('размеры', 'Не указано')}
+        - Производство: {product_info.get('производство', 'Не указано')}
+        - Упаковка: {product_info.get('упаковка', 'Не указано')}
+
+        Напиши описание, которое:
+        1. Содержит 3-4 предложения
+        2. Подчеркивает ключевые преимущества для оптовых покупателей
+        3. Включает технические характеристики (материал, размеры)
+        4. Упоминает упаковку и логистические преимущества
+        5. Написано профессиональным, но понятным языком
+        6. Длиной 100-200 символов
+
+        Верни только текст описания без дополнительных комментариев.
+        """
 
         return prompt
 
-    def get_background_previews(self) -> Dict[str, Any]:
+    def _create_marketing_prompt(self, product_info: Dict[str, Any]) -> str:
+        """Создать промпт для генерации маркетингового текста"""
+
+        prompt = f"""
+        Ты - маркетолог. Создай короткий маркетинговый текст для товара в B2B маркетплейсе.
+
+        Информация о товаре:
+        - Название: {product_info.get('название', 'Неизвестный товар')}
+        - Описание: {product_info.get('описание', 'Нет описания')}
+        - Материал: {product_info.get('материал', 'Не указано')}
+        - Размеры: {product_info.get('размеры', 'Не указано')}
+
+        Создай маркетинговый текст который:
+        1. Привлекает внимание оптовых покупателей
+        2. Подчеркивает выгоду оптовой закупки
+        3. Содержит 1-2 предложения
+        4. Использует убедительные формулировки
+        5. Длиной 50-100 символов
+
+        Верни только маркетинговый текст без дополнительных комментариев.
         """
-        Получить превью всех доступных фонов
 
-        Returns:
-            Dict: Превью фонов
+        return prompt
+
+    async def enhance_product_content(self, product_info: Dict[str, Any],
+                                    product_image_bytes: Optional[bytes] = None,
+                                    generate_image: bool = False,
+                                    generate_description: bool = False,
+                                    generate_marketing: bool = False) -> Dict[str, Any]:
         """
-        try:
-            previews = {}
-            available_templates = self.background_templates.get_available_templates()
-
-            for template_id, template_name in available_templates.items():
-                try:
-                    preview_image = self.background_templates.preview_template(template_id)
-                    # Конвертируем в байты для отправки
-                    preview_bytes = io.BytesIO()
-                    preview_image.save(preview_bytes, format='JPEG', quality=85)
-                    preview_bytes = preview_bytes.getvalue()
-
-                    previews[template_id] = {
-                        'name': template_name,
-                        'preview_bytes': preview_bytes,
-                        'preview_url': None  # Можно добавить URL если нужно
-                    }
-                except Exception as e:
-                    logger.error(f"Ошибка при создании превью для {template_id}: {e}")
-
-            return previews
-
-        except Exception as e:
-            logger.error(f"Ошибка при получении превью фонов: {e}")
-            return {}
-
-    async def analyze_product_for_marketing(self, product_info: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Проанализировать товар для маркетинговых стратегий
+        Комплексное улучшение контента товара
 
         Args:
             product_info: Информация о товаре
+            product_image_bytes: Байты изображения товара
+            generate_image: Генерировать улучшенное изображение
+            generate_description: Генерировать описание
+            generate_marketing: Генерировать маркетинговый текст
 
         Returns:
-            Dict: Результаты анализа
+            Dict[str, Any]: Обновленная информация о товаре
         """
         try:
-            prompt = f"""
-Проанализируй товар для маркетинговых стратегий B2B:
+            logger.info("Начало комплексного улучшения контента товара")
 
-ТОВАР: {product_info.get('название', 'Товар')}
-Описание: {product_info.get('описание', '')}
-Материал: {product_info.get('материал', '')}
-Производство: {product_info.get('производство', '')}
+            enhanced_info = product_info.copy()
 
-Оцени по шкале 1-10:
-1. Потенциал спроса (seasonality_score)
-2. Маржинальность (margin_potential)
-3. Сложность продаж (sales_complexity)
-4. Целевая аудитория (target_market_broadness)
-5. Уникальность (uniqueness_score)
+            # TODO: Gemini не может генерировать изображения с нуля
+            # Временно отключаем генерацию изображений
+            if generate_image and product_image_bytes:
+                logger.info("⚠️ Генерация изображений временно отключена - Gemini не создает изображения с нуля")
+                # enhanced_image = await self.generate_enhanced_image(
+                #     product_image_bytes,
+                #     product_info,
+                #     background_type="professional_studio"
+                # )
+                # if enhanced_image:
+                #     enhanced_info['enhanced_image_bytes'] = enhanced_image
 
-Дай рекомендации:
-1. Основные преимущества для опта
-2. Ключевые маркетинговые аргументы
-3. Возможные каналы продаж
-4. Периодичность закупок
+            # Генерация описания
+            if generate_description:
+                description = await self.generate_product_description(product_info)
+                if description:
+                    enhanced_info['generated_description'] = description
 
-Формат ответа - структурированный JSON."""
+            # Генерация маркетингового текста
+            if generate_marketing:
+                marketing_text = await self.generate_marketing_text(product_info)
+                if marketing_text:
+                    enhanced_info['marketing_text'] = marketing_text
 
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.text_model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.3,
-                        "max_output_tokens": 500,
-                    }
-                )
-            )
-
-            if response and response.text:
-                # Здесь можно добавить парсинг JSON ответа
-                return {'analysis': response.text.strip(), 'recommendations': True}
-
-            return {'analysis': None, 'recommendations': False}
+            logger.info("Завершено комплексное улучшение контента товара")
+            return enhanced_info
 
         except Exception as e:
-            logger.error(f"Ошибка при анализе товара для маркетинга: {e}")
-            return {'analysis': None, 'recommendations': False}
+            # Дополнительная диагностика для отладки
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"Ошибка при комплексном улучшении контента: {e}")
+            logger.error(f"Full traceback: {error_details}")
+            return product_info
+
+    async def batch_enhance_products(self, products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Массовое улучшение контента для списка товаров
+
+        Args:
+            products: Список товаров
+
+        Returns:
+            List[Dict[str, Any]]: Список улучшенных товаров
+        """
+        enhanced_products = []
+
+        for i, product in enumerate(products):
+            logger.info(f"Улучшение контента для товара {i + 1}/{len(products)}")
+
+            try:
+                # Комплексное улучшение с ограничениями (без генерации изображений)
+                enhanced_product = await self.enhance_product_content(
+                    product,
+                    product_image_bytes=product.get('image_bytes'),
+                    generate_image=False,  # Временно отключено
+                    generate_description=True,
+                    generate_marketing=True
+                )
+
+                enhanced_products.append(enhanced_product)
+
+                # Небольшая задержка между запросами
+                if i < len(products) - 1:
+                    await asyncio.sleep(1.0)
+
+            except Exception as e:
+                logger.error(f"Ошибка при улучшении товара {i + 1}: {e}")
+                enhanced_products.append(product)
+
+        return enhanced_products
+
+    def get_enhancement_statistics(self) -> Dict[str, Any]:
+        """Получить статистику использования сервиса генерации контента"""
+        return self.usage_limits.get_daily_usage()
 
 # Глобальный экземпляр сервиса
 _content_generation_service = None
 
 def get_content_generation_service(sheets_manager=None) -> ContentGenerationService:
-    """Получить экземпляр сервиса генерации контента"""
+    """Получение экземпляра сервиса генерации контента"""
     global _content_generation_service
     if _content_generation_service is None:
         _content_generation_service = ContentGenerationService(sheets_manager)
     return _content_generation_service
+
+async def initialize_content_generation_service(sheets_manager=None) -> bool:
+    """Инициализация сервиса генерации контента"""
+    try:
+        service = get_content_generation_service(sheets_manager)
+        # Пробуем сгенерировать тестовый текст для проверки соединения
+        test_response = await service.call_gemini_api("Ответь одним словом: тест")
+        if test_response:
+            logger.info("Сервис генерации контента успешно инициализирован")
+            return True
+        else:
+            logger.error("Не удалось проверить работу сервиса генерации контента")
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка инициализации сервиса генерации контента: {e}")
+        return False

@@ -10,7 +10,8 @@ DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
 # Google Gemini API Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+GEMINI_RECOGNITION_MODEL = os.getenv("GEMINI_RECOGNITION_MODEL", "gemini-2.0-flash-exp")
+GEMINI_CONTENT_GENERATION_MODEL = os.getenv("GEMINI_CONTENT_GENERATION_MODEL", "gemini-2.5-flash-image")
 
 # Google Drive Configuration
 GOOGLE_DRIVE_SCOPES = [
@@ -28,11 +29,12 @@ PHOTO_QUALITY = 85
 DRIVE_FOLDER_NAME = "MarketBot Images"
 
 # Proxy Settings
+USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
 HTTP_PROXY = os.getenv("HTTP_PROXY")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY")
 
-# Configure proxy for all HTTP requests
-if HTTP_PROXY or HTTPS_PROXY:
+# Configure proxy for all HTTP requests if enabled
+if USE_PROXY and (HTTP_PROXY or HTTPS_PROXY):
     import urllib.request
     proxy_handler = urllib.request.ProxyHandler({
         'http': HTTP_PROXY,
@@ -40,6 +42,11 @@ if HTTP_PROXY or HTTPS_PROXY:
     })
     opener = urllib.request.build_opener(proxy_handler)
     urllib.request.install_opener(opener)
+    print(f"Прокси включен: HTTP={HTTP_PROXY}, HTTPS={HTTPS_PROXY}")
+elif not USE_PROXY:
+    print("Прокси отключен в настройках")
+else:
+    print("Прокси не настроен")
 
 # Content Generation Settings
 ENABLE_CONTENT_GENERATION = os.getenv("ENABLE_CONTENT_GENERATION", "True").lower() == "true"

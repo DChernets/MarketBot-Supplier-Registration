@@ -45,16 +45,32 @@ PHOTO_UPLOAD, PHOTO_CONFIRMATION, LOCATION_SELECTION, QUANTITY_INPUT, PRODUCT_CO
 class MarketBot:
     def __init__(self):
         self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        self.sheets_manager = None
+        self._sheets_manager = None  # Приватный атрибут для синглтона
         self.gemini_service = None
         self.image_storage_service = None
         self.content_generation_service = None
         self.services_initialized = False
         self.setup_handlers()
 
+    @property
+    def sheets_manager(self):
+        """Ленивая инициализация GoogleSheetsManager как синглтон"""
+        if self._sheets_manager is None:
+            try:
+                self._sheets_manager = GoogleSheetsManager()
+                logger.info("GoogleSheetsManager успешно инициализирован")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации GoogleSheetsManager: {e}")
+                self._sheets_manager = None
+                raise
+        return self._sheets_manager
+
     async def safe_edit_message_text(self, query, text, reply_markup=None, parse_mode=None):
         """Безопасное редактирование сообщения с fallback на caption"""
         message = query.message
+
+        # Проверяем, есть ли у сообщения текст или caption
+        has_text = bool(message.text) or bool(message.caption)
 
         # Если сообщение имеет фотографию, используем edit_message_caption
         if message.photo:
@@ -75,8 +91,8 @@ class MarketBot:
                     )
                 except Exception as e2:
                     logger.error(f"Failed to send reply message: {e2}")
-        else:
-            # Если сообщение без фото, используем edit_message_text
+        elif has_text:
+            # Если сообщение без фото, но с текстом, используем edit_message_text
             try:
                 await query.edit_message_text(
                     text=text,
@@ -94,6 +110,27 @@ class MarketBot:
                     )
                 except Exception as e2:
                     logger.error(f"Failed to send reply message: {e2}")
+        else:
+            # Если сообщение не имеет ни текста, ни фото, просто отправляем новое сообщение
+            logger.warning("Message has no text or photo, sending new message instead of editing")
+            try:
+                await message.reply_text(
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode
+                )
+            except Exception as e:
+                logger.error(f"Failed to send reply message: {e}")
+                # Последний fallback - пробуем отправить напрямую пользователю
+                try:
+                    await query.bot.send_message(
+                        chat_id=query.from_user.id,
+                        text=text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode
+                    )
+                except Exception as e2:
+                    logger.error(f"Failed to send direct message: {e2}")
 
   
     async def send_photo_from_telegram_url(self, chat_id: int, photo_url: str, caption: str = None, reply_markup=None):
@@ -284,9 +321,6 @@ class MarketBot:
     async def start_command(self, update: Update, context):
         """Обработчик команды /start"""
         try:
-            # Инициализация Google Sheets (здесь будет обработка ошибок)
-            self.sheets_manager = GoogleSheetsManager()
-
             user = update.effective_user
             telegram_user_id = user.id
             telegram_username = user.username or "Нет username"
@@ -459,12 +493,12 @@ class MarketBot:
         elif query.data == 'cancel_photo_upload':
             logger.info(f"handle_callback: calling cancel_photo_recognition")
             await self.cancel_photo_recognition(update, context)
-        elif query.data.startswith('enhance_content_'):
-            logger.info(f"handle_callback: calling enhance_product_content")
-            await self.enhance_product_content(update, context)
         elif query.data.startswith('enhance_content_limit_'):
             logger.info(f"handle_callback: calling enhance_content_limit_info")
             await self.enhance_content_limit_info(update, context)
+        elif query.data.startswith('enhance_content_'):
+            logger.info(f"handle_callback: calling enhance_product_content")
+            await self.enhance_product_content(update, context)
         else:
             logger.warning(f"handle_callback: unknown callback data pattern: {query.data}")
 
@@ -732,9 +766,6 @@ class MarketBot:
                 logger.error("Error in profile_command: update.message is None")
                 return
 
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
-
             user = update.effective_user
             telegram_user_id = user.id
 
@@ -745,8 +776,8 @@ class MarketBot:
                 all_locations = []
                 telegram_user_id = supplier['telegram_user_id']
 
-                # Сначала получаем все supplier_id для этого пользователя
-                all_suppliers = self.sheets_manager.suppliers_sheet.get_all_records()
+                # Сначала получаем все supplier_id для этого пользователя (используем кеш)
+                all_suppliers = self.sheets_manager.get_all_suppliers()
                 user_supplier_ids = []
 
                 for supp_record in all_suppliers:
@@ -832,9 +863,9 @@ class MarketBot:
             await query.edit_message_text("❌ Ошибка: поставщик не найден")
             return
 
-        # Находим все локации пользователя
+        # Находим все локации пользователя (используем кеш)
         all_locations = []
-        all_suppliers = self.sheets_manager.suppliers_sheet.get_all_records()
+        all_suppliers = self.sheets_manager.get_all_suppliers()
         user_supplier_ids = []
 
         for supp_record in all_suppliers:
@@ -1433,8 +1464,6 @@ class MarketBot:
             query = update.callback_query
             await query.answer()
 
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
 
             # Инициализируем сервисы если необходимо
             if not self.services_initialized:
@@ -1490,20 +1519,32 @@ class MarketBot:
 
                     # Используем новые поля из Google Sheets
                     product_name = str(product.get('название', product.get('name', 'Без названия')))
-                    description_field = str(product.get('описание', product.get('description', '')))
+
+                    # Проверяем описание и полное описание (улучшенное)
+                    description_field = product.get('описание', product.get('description', ''))
+                    full_description_field = product.get('full_description', '')
+
+                    # Используем улучшенное описание, если оно есть, иначе базовое
+                    if full_description_field and str(full_description_field).strip() and str(full_description_field) != 'None':
+                        description_field = str(full_description_field)
+                    elif description_field and str(description_field).strip() and str(description_field) != 'None':
+                        description_field = str(description_field)
+                    else:
+                        description_field = ''
 
                     # Если название пустое, пробуем извлечь из описания
                     if product_name == 'Без названия' or not product_name.strip():
                         product_name = self.extract_product_name(description_field)
 
-                    # Формируем краткое описание
+                    # Формируем краткое описание с безопасной обработкой
                     if description_field and description_field.strip():
                         short_desc = description_field
                         # Ограничиваем длину
                         if len(short_desc) > 150:
                             short_desc = short_desc[:147] + "..."
                     else:
-                        short_desc = self.extract_short_description(description_field, 80)
+                        # Безопасно вызываем extract_short_description с пустой строкой
+                        short_desc = self.extract_short_description('', 80)
 
                     # Безопасная обработка quantity
                     quantity = product.get('quantity', '0')
@@ -1635,6 +1676,9 @@ class MarketBot:
             logger.error(f"Error in show_my_products: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"User ID: {user_id}")
+            logger.error(f"Supplier ID: {supplier_id}")
+            logger.error(f"Products count: {len(products) if products else 0}")
 
             try:
                 if hasattr(update, 'callback_query') and update.callback_query:
@@ -1663,8 +1707,6 @@ class MarketBot:
             context.user_data['state'] = LOCATION_SELECTION
 
             # Получаем локации пользователя
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
 
             user_id = query.from_user.id
             supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
@@ -1783,8 +1825,6 @@ class MarketBot:
 
             product_id = query.data.replace('edit_product_', '')
 
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
 
             product = self.sheets_manager.get_product_by_id(product_id)
             if not product:
@@ -1809,7 +1849,9 @@ class MarketBot:
             if created_at and created_at.strip():
                 caption += f"📅 Добавлен: {created_at}\n"
 
-            caption += f"\n📝 Функция редактирования будет доступна в следующей версии."
+            caption += f"\n\n🚧 ВНИМАНИЕ: Функция редактирования товара сейчас находится в разработке.\n"
+            caption += f"📝 Вы можете только просматривать информацию о товаре.\n"
+            caption += f"💡 Для изменения товара удалите его и добавьте заново."
 
             # Кнопка возврата
             keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
@@ -1862,6 +1904,18 @@ class MarketBot:
 
         except Exception as e:
             logger.error(f"Error in edit_product: {e}")
+            try:
+                query = update.callback_query
+                await self.safe_edit_message_text(
+                    query,
+                    "❌ Произошла ошибка при загрузке информации о товаре. Попробуйте позже."
+                )
+            except Exception as e2:
+                logger.error(f"Failed to show error message: {e2}")
+                try:
+                    await query.message.reply_text("❌ Произошла ошибка при загрузке информации о товаре. Попробуйте позже.")
+                except Exception as e3:
+                    logger.error(f"Failed to send error message: {e3}")
 
     async def delete_product(self, update: Update, context):
         """Удалить товар"""
@@ -1871,8 +1925,6 @@ class MarketBot:
 
             product_id = query.data.replace('delete_product_', '')
 
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
 
             success = self.sheets_manager.delete_product(product_id)
 
@@ -1970,8 +2022,6 @@ class MarketBot:
     async def back_to_profile(self, update: Update, context):
         """Вернуться в профиль из callback"""
         try:
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
 
             query = update.callback_query
             user = query.from_user
@@ -2099,8 +2149,6 @@ class MarketBot:
     async def save_products(self, update: Update, context, quantities):
         """Сохранить товары в базу данных с новой JSON-структурой"""
         try:
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
 
             # Инициализируем сервисы если необходимо
             if not self.services_initialized:
@@ -2229,22 +2277,31 @@ class MarketBot:
 
                     # Запускаем генерацию контента
                     result = await self.content_generation_service.enhance_product_content(
-                        user_id=user_id,
                         product_info=product,
-                        image_bytes=image_bytes
+                        product_image_bytes=image_bytes,
+                        generate_image=False,  # Временно отключено
+                        generate_description=True,
+                        generate_marketing=True
                     )
 
-                    if result.get('success'):
+                    # Проверяем, был ли сгенерирован контент
+                    has_generated_content = (
+                        result.get('generated_description') or
+                        result.get('marketing_text') or
+                        result.get('enhanced_image_bytes')
+                    )
+
+                    if has_generated_content:
                         enhanced_products.append({
                             'product_id': product_id,
                             'product_name': product.get('название', 'Товар'),
-                            'enhanced_image_url': result.get('enhanced_image_url'),
-                            'enhanced_description': result.get('enhanced_description'),
-                            'background_used': result.get('background_used')
+                            'enhanced_description': result.get('generated_description'),
+                            'marketing_text': result.get('marketing_text'),
+                            'has_image': bool(result.get('enhanced_image_bytes'))
                         })
                         logger.info(f"Successfully enhanced content for product {product_id}")
                     else:
-                        logger.warning(f"Content enhancement failed for product {product_id}: {result.get('error')}")
+                        logger.warning(f"No content generated for product {product_id}")
                         failed_products.append(product_id)
 
                 except Exception as e:
@@ -2335,8 +2392,6 @@ class MarketBot:
             query = update.callback_query
             await query.answer()
 
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
 
             user_id = query.from_user.id
             supplier = self.sheets_manager.get_supplier_by_telegram_id(user_id)
@@ -2410,6 +2465,9 @@ class MarketBot:
             product_id = query.data.replace('enhance_content_', '')
             user_id = query.from_user.id
 
+            # Логирование для отладки
+            logger.info(f"Попытка улучшить товар с ID: '{product_id}' из callback_data: '{query.data}'")
+
             # Проверяем лимиты
             limit_check = self.content_generation_service.usage_limits.check_daily_limit(
                 user_id, product_id, 'content_enhancement'
@@ -2425,10 +2483,14 @@ class MarketBot:
                 return
 
             # Получаем информацию о товаре
-            if not self.sheets_manager:
-                self.sheets_manager = GoogleSheetsManager()
 
             product = self.sheets_manager.get_product_by_id(product_id)
+
+            # Логирование для отладки
+            logger.info(f"Результат поиска товара с ID '{product_id}': {'найден' if product else 'не найден'}")
+            if product:
+                logger.info(f"Найден товар: {product.get('название', 'Без названия')}")
+
             if not product:
                 await self.safe_edit_message_text(query, "❌ Товар не найден")
                 return
@@ -2456,9 +2518,11 @@ class MarketBot:
 
             # Запускаем генерацию контента
             result = await self.content_generation_service.enhance_product_content(
-                user_id=user_id,
                 product_info=product,
-                image_bytes=image_bytes
+                product_image_bytes=image_bytes,
+                generate_image=False,  # Временно отключено
+                generate_description=True,
+                generate_marketing=True
             )
 
             # Отправляем результат
@@ -2466,10 +2530,19 @@ class MarketBot:
 
         except Exception as e:
             logger.error(f"Error in enhance_product_content: {e}")
-            await self.safe_edit_message_text(
-                update.callback_query,
-                "❌ Произошла ошибка при улучшении контента. Попробуйте позже."
-            )
+            try:
+                query = update.callback_query
+                await self.safe_edit_message_text(
+                    query,
+                    "❌ Произошла ошибка при улучшении контента. Попробуйте позже."
+                )
+            except Exception as e2:
+                logger.error(f"Failed to show error message: {e2}")
+                # Если не удалось отредактировать сообщение, пытаемся отправить новое
+                try:
+                    await query.message.reply_text("❌ Произошла ошибка при улучшении контента. Попробуйте позже.")
+                except Exception as e3:
+                    logger.error(f"Failed to send error message: {e3}")
 
     async def enhance_content_limit_info(self, update: Update, context):
         """Показать информацию о лимитах генерации контента"""
@@ -2509,7 +2582,14 @@ class MarketBot:
 
         except Exception as e:
             logger.error(f"Error in enhance_content_limit_info: {e}")
-            await self.safe_edit_message_text(update.callback_query, "❌ Ошибка при загрузке информации")
+            try:
+                await self.safe_edit_message_text(query, "❌ Ошибка при загрузке информации")
+            except Exception as e2:
+                logger.error(f"Failed to show error message: {e2}")
+                try:
+                    await query.message.reply_text("❌ Ошибка при загрузке информации")
+                except Exception as e3:
+                    logger.error(f"Failed to send error message: {e3}")
 
     async def show_enhanced_content_result(self, update: Update, original_product: dict, result: dict):
         """Показать результат улучшения контента"""
@@ -2518,10 +2598,17 @@ class MarketBot:
             product_id = original_product.get('product_id', 'unknown')
             product_name = original_product.get('название', 'Товар')
 
-            if not result.get('success'):
+            # Проверяем, был ли сгенерирован контент
+            has_generated_content = (
+                result.get('generated_description') or
+                result.get('marketing_text') or
+                result.get('enhanced_image_bytes')
+            )
+
+            if not has_generated_content:
                 error_message = f"❌ *Не удалось улучшить контент*\n\n"
                 error_message += f"🏷️ {product_name}\n"
-                error_message += f"🔸 Ошибка: {result.get('error', 'Неизвестная ошибка')}\n\n"
+                error_message += f"🔸 Контент не был сгенерирован\n\n"
                 error_message += f"Попробуйте позже или обратитесь в поддержку."
 
                 keyboard = [[InlineKeyboardButton("⬅️ Назад к товарам", callback_data="my_products")]]
@@ -2539,30 +2626,57 @@ class MarketBot:
             success_message = f"✅ *Контент успешно улучшен!*\n\n"
             success_message += f"🏷️ {product_name}\n"
 
+            # Используем правильные поля из результата
             enhanced_image_url = result.get('enhanced_image_url')
-            enhanced_description = result.get('enhanced_description')
-            background_used = result.get('background_used')
+            generated_description = result.get('generated_description')
+            marketing_text = result.get('marketing_text')
             variations = result.get('variations', [])
 
-            if enhanced_description:
-                success_message += f"\n📝 *Новое B2B описание:*\n{enhanced_description}\n"
+            if generated_description:
+                success_message += f"\n📝 *Сгенерированное B2B описание:*\n{generated_description}\n"
 
-            if background_used:
-                bg_names = {
-                    'professional_studio': 'Профессиональная студия',
-                    'clean_white_background': 'Чистый белый фон',
-                    'marketing_showcase': 'Маркетинговая витрина',
-                    'minimalist_display': 'Минималистичное отображение'
-                }
-                bg_name = bg_names.get(background_used, background_used)
-                success_message += f"\n🎨 Использован фон: {bg_name}\n"
+            if marketing_text:
+                success_message += f"\n📢 *Маркетинговый текст:*\n{marketing_text}\n"
 
-            if variations:
-                success_message += f"\n💡 Дополнительные варианты описания:\n"
-                for i, variation in enumerate(variations[:2], 1):  # Показываем первые 2 варианта
-                    success_message += f"{i}. {variation}\n"
+            # TODO: Временно убрано, так как эти поля не генерируются
+            # if background_used:
+            #     bg_names = {
+            #         'professional_studio': 'Профессиональная студия',
+            #         'clean_white_background': 'Чистый белый фон',
+            #         'marketing_showcase': 'Маркетинговая витрина',
+            #         'minimalist_display': 'Минималистичное отображение'
+            #     }
+            #     bg_name = bg_names.get(background_used, background_used)
+            #     success_message += f"\n🎨 Использован фон: {bg_name}\n"
+
+            # if variations:
+            #     success_message += f"\n💡 Дополнительные варианты описания:\n"
+            #     for i, variation in enumerate(variations[:2], 1):  # Показываем первые 2 варианта
+            #         success_message += f"{i}. {variation}\n"
 
             success_message += f"\n💎 Ваш товар теперь выглядит профессионально для B2B продаж!"
+
+            # Автоматически сохраняем улучшенный контент в Google Sheets
+            try:
+                product_id = original_product.get('product_id')
+                if generated_description and product_id:
+                    logger.info(f"Сохраняем улучшенное описание для товара {product_id}")
+                    success = self.sheets_manager.update_product(
+                        product_id=product_id,
+                        short_description=generated_description  # Сохраняем в колонку 'описание'
+                    )
+                    if success:
+                        success_message += f"\n✅ *Улучшенное описание автоматически сохранено!*"
+                        logger.info(f"Улучшенное описание для товара {product_id} успешно сохранено")
+                        # Принудительно инвалидируем кеш чтобы изменения были видны сразу
+                        self.sheets_manager.invalidate_cache("products")
+                        logger.info(f"Кеш products инвалидирован после сохранения")
+                    else:
+                        logger.warning(f"Не удалось сохранить улучшенное описание для товара {product_id}")
+                else:
+                    logger.warning(f"Нет product_id или generated_description для сохранения")
+            except Exception as save_error:
+                logger.error(f"Ошибка при сохранении улучшенного описания: {save_error}")
 
             keyboard = [[InlineKeyboardButton("📦 Мои товары", callback_data="my_products")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2607,10 +2721,18 @@ class MarketBot:
 
         except Exception as e:
             logger.error(f"Error in show_enhanced_content_result: {e}")
-            await self.safe_edit_message_text(
-                update.callback_query,
-                "❌ Ошибка при отображении результата улучшения контента"
-            )
+            try:
+                query = update.callback_query
+                await self.safe_edit_message_text(
+                    query,
+                    "❌ Ошибка при отображении результата улучшения контента"
+                )
+            except Exception as e2:
+                logger.error(f"Failed to show error message: {e2}")
+                try:
+                    await query.message.reply_text("❌ Ошибка при отображении результата улучшения контента")
+                except Exception as e3:
+                    logger.error(f"Failed to send error message: {e3}")
 
     def run(self):
         """Запуск бота"""

@@ -1,6 +1,10 @@
 import gspread
+import logging
+import time
 from google.oauth2.service_account import Credentials
 from src.config import GOOGLE_SHEETS_CREDENTIALS_FILE, GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_DRIVE_SCOPES
+
+logger = logging.getLogger(__name__)
 
 class GoogleSheetsManager:
     def __init__(self):
@@ -21,6 +25,10 @@ class GoogleSheetsManager:
 
         # Инициализируем заголовки
         self._init_sheet_headers()
+
+        # Кеширование для ускорения запросов
+        self._cache = {}
+        self._cache_timeout = 60  # 60 секунд
 
     def _get_or_create_sheet(self, sheet_name):
         try:
@@ -102,12 +110,45 @@ class GoogleSheetsManager:
             contact_name, now, now
         ]
         self.suppliers_sheet.append_row(row)
+        # Инвалидируем кеш для suppliers
+        self.invalidate_cache("suppliers")
         return internal_id
+
+    def _get_cached_records(self, sheet_name, sheet):
+        """Получить записи из кеша или загрузить из API"""
+        cache_key = f"{sheet_name}_records"
+        current_time = time.time()
+
+        # Проверяем кеш
+        if cache_key in self._cache:
+            cache_data = self._cache[cache_key]
+            if current_time - cache_data['timestamp'] < self._cache_timeout:
+                return cache_data['records']
+
+        # Загружаем из API
+        records = sheet.get_all_records()
+
+        # Сохраняем в кеш
+        self._cache[cache_key] = {
+            'records': records,
+            'timestamp': current_time
+        }
+
+        return records
+
+    def invalidate_cache(self, sheet_name=None):
+        """Очистить кеш для конкретного листа или всего кеша"""
+        if sheet_name:
+            cache_key = f"{sheet_name}_records"
+            if cache_key in self._cache:
+                del self._cache[cache_key]
+        else:
+            self._cache.clear()
 
     def get_supplier_by_telegram_id(self, telegram_user_id):
         """Получение поставщика по telegram_user_id"""
         try:
-            all_records = self.suppliers_sheet.get_all_records()
+            all_records = self._get_cached_records("suppliers", self.suppliers_sheet)
             for record in all_records:
                 # Сравниваем как число и как строку для надежности
                 telegram_id = record.get("telegram_user_id")
@@ -117,6 +158,13 @@ class GoogleSheetsManager:
         except:
             return None
 
+    def get_all_suppliers(self):
+        """Получить всех поставщиков через кеш"""
+        try:
+            return self._get_cached_records("suppliers", self.suppliers_sheet)
+        except:
+            return []
+
     def add_location(self, location_id, supplier_internal_id, market_name, pavilion_number, contact_phones):
         """Добавление новой локации поставщика"""
         row = [
@@ -124,12 +172,14 @@ class GoogleSheetsManager:
             pavilion_number, contact_phones
         ]
         self.locations_sheet.append_row(row)
+        # Инвалидируем кеш для locations
+        self.invalidate_cache("locations")
         return location_id
 
     def get_locations_by_supplier_id(self, supplier_internal_id):
         """Получение всех локаций поставщика"""
         try:
-            all_records = self.locations_sheet.get_all_records()
+            all_records = self._get_cached_records("locations", self.locations_sheet)
             locations = []
             for record in all_records:
                 supplier_id_field = record.get("supplier_internal_id")
@@ -177,6 +227,8 @@ class GoogleSheetsManager:
                     # Обновляем строку
                     self.locations_sheet.update(f"A{row_num}:E{row_num}", [current_row])
                     print(f"GoogleSheets: Successfully updated row {row_num}")
+                    # Инвалидируем кеш для locations
+                    self.invalidate_cache("locations")
                     return True
 
             print(f"GoogleSheets: Location {location_id} not found")
@@ -204,6 +256,8 @@ class GoogleSheetsManager:
                     print(f"Found match at row {row_num}, deleting...")
                     self.locations_sheet.delete_rows(row_num)
                     print("Location deleted successfully")
+                    # Инвалидируем кеш для locations
+                    self.invalidate_cache("locations")
                     return True
 
             print(f"Location {location_id} not found")
@@ -244,6 +298,8 @@ class GoogleSheetsManager:
 
 
         self.products_sheet.append_row(row)
+        # Инвалидируем кеш для products
+        self.invalidate_cache("products")
         return product_id
 
     def add_product_legacy(self, product_id, supplier_internal_id, location_id, short_description,
@@ -273,7 +329,7 @@ class GoogleSheetsManager:
     def get_products_by_supplier_id(self, supplier_internal_id):
         """Получение всех товаров поставщика"""
         try:
-            all_records = self.products_sheet.get_all_records()
+            all_records = self._get_cached_records("products", self.products_sheet)
             products = []
 
             for record in all_records:
@@ -300,21 +356,30 @@ class GoogleSheetsManager:
     def update_product(self, product_id, short_description=None, full_description=None, quantity=None):
         """Обновление товара"""
         try:
-            all_records = self.products_sheet.get_all_records()
+            all_records = self._get_cached_records("products", self.products_sheet)
             for i, record in enumerate(all_records):
                 if str(record.get("product_id")) == str(product_id):
                     row_num = i + 2  # +2 из-за заголовков и 0-based индексации
                     current_row = self.products_sheet.row_values(row_num)
 
-                    # Обновляем только переданные поля
-                    if short_description is not None:
-                        current_row[3] = short_description
-                    if full_description is not None:
-                        current_row[4] = full_description
-                    if quantity is not None:
+                    # Обновляем только переданные поля в пределах колонок A-H (индексы 0-7)
+                    if short_description is not None and len(current_row) > 4:
+                        current_row[4] = short_description  # Колонка 'описание'
+                    if full_description is not None and len(current_row) > 4:
+                        current_row[4] = full_description  # Используем ту же колонку для full_description
+                    if quantity is not None and len(current_row) > 5:
                         current_row[5] = quantity
 
+                    # Обрезаем массив до 8 элементов (колонки A-H)
+                    current_row = current_row[:8]
+                    if len(current_row) < 8:
+                        # Дополняем до 8 элементов если нужно
+                        current_row.extend([''] * (8 - len(current_row)))
+
+                    # Обновляем только существующие колонки (A-H)
                     self.products_sheet.update(f"A{row_num}:H{row_num}", [current_row])
+                    # Инвалидируем кеш для products
+                    self.invalidate_cache("products")
                     return True
             return False
         except Exception as e:
@@ -329,6 +394,8 @@ class GoogleSheetsManager:
                 if str(record.get("product_id")) == str(product_id):
                     row_num = i + 2  # +2 из-за заголовков и 0-based индексации
                     self.products_sheet.delete_rows(row_num)
+                    # Инвалидируем кеш для products
+                    self.invalidate_cache("products")
                     return True
             return False
         except Exception as e:
