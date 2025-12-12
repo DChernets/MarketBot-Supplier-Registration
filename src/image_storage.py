@@ -11,6 +11,7 @@ from typing import List, Optional, Dict, Any
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
 from PIL import Image
 import io
 from datetime import datetime
@@ -213,7 +214,11 @@ class ImageStorageService:
             }
 
             # Загрузка файла
-            media = io.BytesIO(optimized_bytes)
+            media = MediaIoBaseUpload(
+                io.BytesIO(optimized_bytes),
+                mimetype='image/jpeg',
+                resumable=True
+            )
 
             logger.info(f"Загрузка файла: {upload_filename}")
 
@@ -227,13 +232,17 @@ class ImageStorageService:
             )
 
             file_id = file.get('id')
-            file_url = file.get('webViewLink')
 
             # Делаем файл общедоступным
             await self._make_file_public(file_id)
 
+            # Возвращаем прямую ссылку для скачивания (не webViewLink)
+            # Формат: https://drive.google.com/uc?export=view&id=FILE_ID
+            direct_link = f"https://drive.google.com/uc?export=view&id={file_id}"
+
             logger.info(f"Файл успешно загружен: {file_id}")
-            return file_url
+            logger.info(f"Прямая ссылка: {direct_link}")
+            return direct_link
 
         except Exception as e:
             logger.error(f"Ошибка загрузки изображения: {e}")

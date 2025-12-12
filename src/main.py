@@ -1481,7 +1481,8 @@ class MarketBot:
 
             if not supplier:
                 logger.warning(f"Supplier not found for user_id: {user_id}")
-                await query.edit_message_text(
+                await self.safe_edit_message_text(
+                    query,
                     "❌ Вы не зарегистрированы. Используйте /start для регистрации."
                 )
                 return
@@ -1489,12 +1490,16 @@ class MarketBot:
             supplier_id = supplier['internal_id']
             logger.info(f"Supplier ID: {supplier_id}")
 
+            # Очищаем кэш перед получением товаров, чтобы получить актуальные данные
+            self.sheets_manager.invalidate_cache("products")
+
             products = self.sheets_manager.get_products_by_supplier_id(supplier_id)
             logger.info(f"Products returned: {products}, type: {type(products)}, length: {len(products) if products else 'N/A'}")
 
             if not products:
                 logger.info(f"No products found for supplier {supplier_id}")
-                await query.edit_message_text(
+                await self.safe_edit_message_text(
+                    query,
                     "📦 Мои товары\n\n"
                     "У вас пока нет сохраненных товаров.\n\n"
                     "Используйте кнопку 📸 ФОТО для добавления товаров."
@@ -1502,7 +1507,8 @@ class MarketBot:
                 return
 
             # Сначала редактируем текущее сообщение на заголовок
-            await query.edit_message_text(
+            await self.safe_edit_message_text(
+                query,
                 f"📦 Мои товары ({len(products)} шт.)\n\n"
                 "Загружаю изображения...",
                 reply_markup=InlineKeyboardMarkup([[
@@ -1554,7 +1560,22 @@ class MarketBot:
                         quantity_str = str(quantity)
 
                     created_at = str(product.get('created_at', ''))
+
+                    # Приоритет: улучшенное изображение > оригинальное
+                    enhanced_image_url = product.get('enhanced_image_url', '')
                     photo_url = product.get('photo_urls', '')
+
+                    # Проверяем, есть ли локальное улучшенное изображение
+                    enhanced_local_path = None
+                    if enhanced_image_url and str(enhanced_image_url).startswith('local:'):
+                        # Извлекаем имя файла из "local:filename"
+                        filename = str(enhanced_image_url).replace('local:', '')
+                        enhanced_local_path = f"/root/myAI/MarketBot/enhanced_images/{filename}"
+                        # Проверяем существование файла
+                        import os
+                        if not os.path.exists(enhanced_local_path):
+                            logger.warning(f"Enhanced image file not found: {enhanced_local_path}")
+                            enhanced_local_path = None
 
                     # Формируем описание товара с новой структурой
                     caption = f"🏷️ {product_name}\n"
@@ -1594,16 +1615,47 @@ class MarketBot:
                     ])
 
                     try:
-                        # Проверяем и отправляем фото если есть
-                        if photo_url:
+                        product_markup = InlineKeyboardMarkup([product_buttons])
+
+                        # Приоритет отправки: локальное улучшенное > URL улучшенное > оригинальное
+                        if enhanced_local_path:
+                            # Отправляем улучшенное изображение из локального файла
+                            logger.info(f"Sending enhanced image from local file for product {product_id}: {enhanced_local_path}")
+                            with open(enhanced_local_path, 'rb') as photo_file:
+                                await context.bot.send_photo(
+                                    chat_id=user_id,
+                                    photo=photo_file,
+                                    caption=caption + "\n\n✨ Улучшенное изображение",
+                                    reply_markup=product_markup
+                                )
+                            logger.info(f"Enhanced image sent successfully for product {product_id}")
+
+                        elif enhanced_image_url and not str(enhanced_image_url).startswith('local:'):
+                            # Отправляем улучшенное изображение по URL
+                            logger.info(f"Sending enhanced image from URL for product {product_id}: {enhanced_image_url}")
+                            success = await self.send_photo_from_telegram_url(
+                                chat_id=user_id,
+                                photo_url=str(enhanced_image_url),
+                                caption=caption + "\n\n✨ Улучшенное изображение",
+                                reply_markup=product_markup
+                            )
+                            if not success:
+                                # Fallback на оригинальное фото
+                                logger.warning(f"Failed to send enhanced image, using original")
+                                if photo_url:
+                                    await self.send_photo_from_telegram_url(
+                                        chat_id=user_id,
+                                        photo_url=str(photo_url),
+                                        caption=caption,
+                                        reply_markup=product_markup
+                                    )
+
+                        elif photo_url:
+                            # Отправляем оригинальное фото
                             photo_url_str = str(photo_url) if photo_url else ""
                             if photo_url_str.strip() and not photo_url_str.isdigit():
-                                logger.info(f"Sending photo for product {product_id}: {photo_url_str}")
+                                logger.info(f"Sending original photo for product {product_id}: {photo_url_str}")
 
-                                # Создаем клавиатуру для этого товара
-                                product_markup = InlineKeyboardMarkup([product_buttons])
-
-                                # Отправляем фото с описанием через нашу функцию
                                 success = await self.send_photo_from_telegram_url(
                                     chat_id=user_id,
                                     photo_url=photo_url_str,
@@ -1611,9 +1663,7 @@ class MarketBot:
                                     reply_markup=product_markup
                                 )
 
-                                if success:
-                                    logger.info(f"Photo sent successfully for product {product_id}")
-                                else:
+                                if not success:
                                     # Если фото не отправилось, отправляем текст с ссылкой
                                     logger.warning(f"Failed to send photo for product {product_id}")
                                     caption += f"\n🖼️ Фото: {photo_url_str}"
@@ -1624,15 +1674,13 @@ class MarketBot:
                                     )
                             else:
                                 # Если нет фото URL, отправляем только текст
-                                product_markup = InlineKeyboardMarkup([product_buttons])
                                 await context.bot.send_message(
                                     chat_id=user_id,
                                     text=caption,
                                     reply_markup=product_markup
                                 )
                         else:
-                            # Если нет фото, отправляем только текст
-                            product_markup = InlineKeyboardMarkup([product_buttons])
+                            # Если нет фото вообще, отправляем только текст
                             await context.bot.send_message(
                                 chat_id=user_id,
                                 text=caption,
@@ -2165,6 +2213,7 @@ class MarketBot:
             uploaded_photos = context.user_data.get('uploaded_photos', [])
 
             saved_products = 0
+            saved_product_data = []  # Сохраняем полные данные товаров для автоматической генерации
 
             for i, (result, quantity) in enumerate(zip(recognition_results, quantities)):
                 product_id = str(uuid.uuid4())
@@ -2175,6 +2224,7 @@ class MarketBot:
 
                 # Используем прямой URL из Telegram
                 image_urls = ""
+                image_bytes = None
                 try:
                     if i < len(uploaded_photos):
                         photo_data = uploaded_photos[i]
@@ -2182,6 +2232,8 @@ class MarketBot:
                         if telegram_url:
                             image_urls = telegram_url
                             logger.info(f"Using Telegram URL for product {product_id}: {telegram_url}")
+                        # Сохраняем image_bytes для автоматической генерации
+                        image_bytes = photo_data.get('bytes')
                 except Exception as e:
                     logger.warning(f"Failed to get Telegram URL for image: {e}")
 
@@ -2196,10 +2248,13 @@ class MarketBot:
 
                 if success:
                     saved_products += 1
-                    # Сохраняем ID товара для автоматической генерации
-                    if 'saved_product_ids' not in locals():
-                        saved_product_ids = []
-                    saved_product_ids.append(product_id)
+                    # Сохраняем полные данные товара для автоматической генерации
+                    saved_product_data.append({
+                        'product_id': product_id,
+                        'product_info': product_data,
+                        'photo_urls': image_urls,
+                        'image_bytes': image_bytes
+                    })
 
             # Очищаем контекст
             context.user_data.clear()
@@ -2211,15 +2266,23 @@ class MarketBot:
             )
 
             # Запускаем автоматическую генерацию контента
-            if saved_products > 0 and 'saved_product_ids' in locals():
-                await self.auto_generate_content_for_products(update, context, saved_product_ids)
+            if saved_products > 0 and saved_product_data:
+                await self.auto_generate_content_for_products(update, context, saved_product_data)
 
         except Exception as e:
             logger.error(f"Error in save_products: {e}")
             await update.message.reply_text("❌ Ошибка при сохранении товаров")
 
-    async def auto_generate_content_for_products(self, update: Update, context, product_ids: list):
-        """Автоматически генерирует контент для сохраненных товаров"""
+    async def auto_generate_content_for_products(self, update: Update, context, products_data: list):
+        """Автоматически генерирует контент для сохраненных товаров
+
+        Args:
+            products_data: Список словарей с ключами:
+                - product_id: ID товара
+                - product_info: Данные товара
+                - photo_urls: URL фото
+                - image_bytes: Байты изображения
+        """
         if not ENABLE_CONTENT_GENERATION or not AUTO_GENERATE_CONTENT:
             return
 
@@ -2229,7 +2292,7 @@ class MarketBot:
 
         try:
             user_id = update.effective_user.id
-            logger.info(f"Starting automatic content generation for {len(product_ids)} products")
+            logger.info(f"Starting automatic content generation for {len(products_data)} products")
 
             # Показываем сообщение о начале генерации
             status_message = await update.message.reply_text(
@@ -2242,28 +2305,25 @@ class MarketBot:
             enhanced_products = []
             failed_products = []
 
-            for i, product_id in enumerate(product_ids):
+            for i, product_data_item in enumerate(products_data):
                 try:
-                    logger.info(f"Processing product {i+1}/{len(product_ids)}: {product_id}")
+                    product_id = product_data_item['product_id']
+                    product = product_data_item['product_info']
+                    image_bytes = product_data_item.get('image_bytes')
 
-                    # Получаем информацию о товаре
-                    product = self.sheets_manager.get_product_by_id(product_id)
-                    if not product:
-                        logger.warning(f"Product {product_id} not found")
-                        failed_products.append(product_id)
-                        continue
+                    logger.info(f"Processing product {i+1}/{len(products_data)}: {product_id}")
 
-                    # Получаем оригинальное изображение
-                    image_bytes = None
-                    photo_url = product.get('photo_urls', '')
-                    if photo_url:
-                        try:
-                            response = requests.get(photo_url, timeout=10)
-                            if response.status_code == 200:
-                                image_bytes = response.content
-                                logger.info(f"Downloaded image for product {product_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to download image for {product_id}: {e}")
+                    # Если image_bytes не был передан, пытаемся скачать по URL
+                    if not image_bytes:
+                        photo_url = product_data_item.get('photo_urls', '')
+                        if photo_url:
+                            try:
+                                response = requests.get(photo_url, timeout=10)
+                                if response.status_code == 200:
+                                    image_bytes = response.content
+                                    logger.info(f"Downloaded image for product {product_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to download image for {product_id}: {e}")
 
                     # Проверяем лимиты
                     limit_check = self.content_generation_service.usage_limits.check_daily_limit(
@@ -2275,11 +2335,11 @@ class MarketBot:
                         failed_products.append(product_id)
                         continue
 
-                    # Запускаем генерацию контента
+                    # Запускаем генерацию контента (изображение + описание)
                     result = await self.content_generation_service.enhance_product_content(
                         product_info=product,
                         product_image_bytes=image_bytes,
-                        generate_image=False,  # Временно отключено
+                        generate_image=True,  # Включено улучшение фото через Gemini 2.5 Flash Image
                         generate_description=True,
                         generate_marketing=True
                     )
@@ -2516,14 +2576,75 @@ class MarketBot:
                 except Exception as e:
                     logger.warning(f"Failed to download image for {product_id}: {e}")
 
-            # Запускаем генерацию контента
+            # Запускаем генерацию контента (изображение + описание)
             result = await self.content_generation_service.enhance_product_content(
                 product_info=product,
                 product_image_bytes=image_bytes,
-                generate_image=False,  # Временно отключено
+                generate_image=True,  # Включено улучшение фото через Gemini 2.5 Flash Image
                 generate_description=True,
                 generate_marketing=True
             )
+
+            # Если есть улучшенное изображение - загружаем в Google Drive
+            enhanced_image_path = None
+            enhanced_image_url_for_sheets = None
+
+            if 'enhanced_image_bytes' in result and result['enhanced_image_bytes']:
+                try:
+                    from datetime import datetime
+                    import os
+
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"enhanced_{product_id}_{timestamp}.jpg"
+
+                    # 1. Загружаем в Google Drive (основное хранилище)
+                    if self.image_storage_service:
+                        logger.info(f"Загружаем улучшенное изображение в Google Drive...")
+                        enhanced_image_url_for_sheets = await self.image_storage_service.upload_image(
+                            image_bytes=result['enhanced_image_bytes'],
+                            filename=filename,
+                            product_id=product_id
+                        )
+
+                        if enhanced_image_url_for_sheets:
+                            logger.info(f"✅ Enhanced image uploaded to Google Drive: {enhanced_image_url_for_sheets}")
+                        else:
+                            logger.error("Failed to upload enhanced image to Google Drive")
+
+                    # 2. Сохраняем локально как резервную копию для быстрого доступа
+                    local_dir = "/root/myAI/MarketBot/enhanced_images"
+                    os.makedirs(local_dir, exist_ok=True)
+
+                    enhanced_image_path = os.path.join(local_dir, filename)
+                    with open(enhanced_image_path, 'wb') as f:
+                        f.write(result['enhanced_image_bytes'])
+
+                    logger.info(f"✅ Enhanced image also saved locally as backup: {enhanced_image_path}")
+                    result['enhanced_image_path'] = enhanced_image_path
+
+                except Exception as e:
+                    logger.error(f"Failed to save enhanced image: {e}")
+
+            # Сохраняем улучшенный контент (изображение + описание) в Google Sheets ОДИН РАЗ
+            try:
+                from datetime import datetime
+
+                generated_description = result.get('generated_description')
+
+                # Обновляем только если есть что сохранять
+                if enhanced_image_url_for_sheets or generated_description:
+                    logger.info(f"Сохраняем улучшенный контент для товара {product_id}")
+                    self.sheets_manager.update_product_enhanced_content(
+                        product_id=product_id,
+                        enhanced_image_url=enhanced_image_url_for_sheets,
+                        enhanced_description=generated_description,
+                        content_generated_at=datetime.now().isoformat()
+                    )
+                    # Принудительно инвалидируем кеш чтобы изменения были видны сразу
+                    self.sheets_manager.invalidate_cache("products")
+                    logger.info(f"✅ Улучшенный контент сохранен в Google Sheets")
+            except Exception as e:
+                logger.error(f"Failed to save enhanced content to Google Sheets: {e}")
 
             # Отправляем результат
             await self.show_enhanced_content_result(update, product, result)
@@ -2602,7 +2723,8 @@ class MarketBot:
             has_generated_content = (
                 result.get('generated_description') or
                 result.get('marketing_text') or
-                result.get('enhanced_image_bytes')
+                result.get('enhanced_image_bytes') or
+                result.get('enhanced_image_path')
             )
 
             if not has_generated_content:
@@ -2628,6 +2750,8 @@ class MarketBot:
 
             # Используем правильные поля из результата
             enhanced_image_url = result.get('enhanced_image_url')
+            enhanced_image_path = result.get('enhanced_image_path')  # Локальный путь к улучшенному изображению
+            enhanced_image_bytes = result.get('enhanced_image_bytes')  # Байты улучшенного изображения
             generated_description = result.get('generated_description')
             marketing_text = result.get('marketing_text')
             variations = result.get('variations', [])
@@ -2682,31 +2806,48 @@ class MarketBot:
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             # Если есть улучшенное изображение, показываем его
-            if enhanced_image_url:
-                # Сначала редактируем текущее сообщение с текстом
-                await self.safe_edit_message_text(
-                    query,
-                    success_message,
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
-
-                # Затем отправляем отдельное сообщение с фото
-                success = await self.send_photo_from_telegram_url(
-                    chat_id=query.from_user.id,
-                    photo_url=enhanced_image_url,
-                    caption=f"🎨 *Улучшенное изображение для {product_name}*\n\n"
-                            f"Профессиональный фон и оптимизация для B2B продаж",
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
-
-                if not success:
-                    # Если фото не отправилось, добавляем ссылку в текст
-                    success_message += f"\n\n🖼️ [Улучшенное изображение]({enhanced_image_url})"
+            if enhanced_image_bytes or enhanced_image_path:
+                try:
+                    # Редактируем текущее сообщение с текстом
                     await self.safe_edit_message_text(
                         query,
                         success_message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+
+                    # Отправляем улучшенное изображение напрямую из байтов или файла
+                    if enhanced_image_bytes:
+                        # Отправляем из байтов
+                        from io import BytesIO
+                        await query.message.reply_photo(
+                            photo=BytesIO(enhanced_image_bytes),
+                            caption=f"🎨 *Улучшенное изображение для {product_name}*\n\n"
+                                    f"✨ Профессиональная обработка через Gemini 2.5 Flash Image\n"
+                                    f"📸 Студийное освещение и композиция для B2B продаж",
+                            reply_markup=reply_markup,
+                            parse_mode='Markdown'
+                        )
+                        logger.info(f"✅ Enhanced image sent to Telegram from bytes")
+                    elif enhanced_image_path:
+                        # Отправляем из локального файла
+                        with open(enhanced_image_path, 'rb') as photo_file:
+                            await query.message.reply_photo(
+                                photo=photo_file,
+                                caption=f"🎨 *Улучшенное изображение для {product_name}*\n\n"
+                                        f"✨ Профессиональная обработка через Gemini 2.5 Flash Image\n"
+                                        f"📸 Студийное освещение и композиция для B2B продаж",
+                                reply_markup=reply_markup,
+                                parse_mode='Markdown'
+                            )
+                        logger.info(f"✅ Enhanced image sent to Telegram from file: {enhanced_image_path}")
+
+                except Exception as e:
+                    logger.error(f"Failed to send enhanced image to Telegram: {e}")
+                    # Если не удалось отправить изображение, просто показываем текст
+                    await self.safe_edit_message_text(
+                        query,
+                        success_message + "\n\n⚠️ Изображение сохранено, но не удалось его отобразить",
                         reply_markup=reply_markup,
                         parse_mode='Markdown'
                     )
