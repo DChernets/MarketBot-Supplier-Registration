@@ -52,6 +52,9 @@ NAME, MARKET, PAVILION, PHONE, ADD_MORE_PHONES, ADD_MORE_PHONES_CALLBACK, ADD_LO
 # Новые состояния для распознавания изображений
 PHOTO_UPLOAD, PHOTO_CONFIRMATION, LOCATION_SELECTION, QUANTITY_INPUT, PRODUCT_CONFIRMATION, PRODUCT_MANAGEMENT = range(8, 14)
 
+# Новые состояния для управления каналами
+ADD_CHANNEL_USERNAME, ADD_CHANNEL_DESCRIPTION, EDIT_CHANNEL_DESCRIPTION = range(14, 17)
+
 class MarketBot:
     def __init__(self):
         self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -281,6 +284,7 @@ class MarketBot:
         self.application.add_handler(CommandHandler('help', self.help_command))
         self.application.add_handler(CommandHandler('profile', self.profile_command))
         self.application.add_handler(CommandHandler('cancel', self.cancel))
+        self.application.add_handler(CommandHandler('skip', self.skip_command))
 
         # Обработчики для фото
         self.application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo_message))
@@ -416,6 +420,12 @@ class MarketBot:
             await self.handle_photo_upload_text(update, context)
         elif state == QUANTITY_INPUT:
             await self.handle_quantity_input(update, context)
+        elif state == 'ADD_CHANNEL_USERNAME':
+            await self.get_channel_username(update, context)
+        elif state == 'ADD_CHANNEL_DESCRIPTION':
+            await self.get_channel_description(update, context)
+        elif state == 'EDIT_CHANNEL_DESCRIPTION':
+            await self.update_channel_description(update, context)
         else:
             logger.info(f"handle_text_message: unhandled state '{state}' for message '{message_text}'")
 
@@ -443,7 +453,7 @@ class MarketBot:
         elif query.data.startswith('delete_location_'):
             logger.info(f"handle_callback: calling delete_location_callback")
             await self.delete_location_callback(update, context)
-        elif query.data.startswith('confirm_delete_'):
+        elif query.data.startswith('confirm_delete_location_'):
             logger.info(f"handle_callback: calling confirm_delete_callback")
             await self.confirm_delete_callback(update, context)
         elif query.data == 'cancel_delete' or query.data == 'cancel_edit':
@@ -512,6 +522,24 @@ class MarketBot:
         elif query.data.startswith('view_enhanced_'):
             logger.info(f"handle_callback: calling view_enhanced_content")
             await self.view_enhanced_content(update, context)
+        elif query.data == 'channels':
+            logger.info(f"handle_callback: calling channels_callback")
+            await self.channels_callback(update, context)
+        elif query.data == 'add_channel':
+            logger.info(f"handle_callback: calling add_channel_callback")
+            await self.add_channel_callback(update, context)
+        elif query.data.startswith('edit_channel_'):
+            logger.info(f"handle_callback: calling edit_channel_callback")
+            await self.edit_channel_callback(update, context)
+        elif query.data.startswith('delete_channel_'):
+            logger.info(f"handle_callback: calling delete_channel_callback")
+            await self.delete_channel_callback(update, context)
+        elif query.data.startswith('confirm_delete_channel_'):
+            logger.info(f"handle_callback: calling confirm_delete_channel_callback")
+            await self.confirm_delete_channel_callback(update, context)
+        elif query.data == 'skip_description':
+            logger.info(f"handle_callback: skipping channel description")
+            await self.save_channel(update, context, description="", is_callback=True)
         else:
             logger.warning(f"handle_callback: unknown callback data pattern: {query.data}")
 
@@ -837,7 +865,8 @@ class MarketBot:
 
                 # Добавляем общие кнопки управления
                 keyboard.extend([
-                                        [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")],
+                    [InlineKeyboardButton("📺 МОИ КАНАЛЫ", callback_data="channels")],
+                    [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")],
                     [InlineKeyboardButton("📸", callback_data="photo_recognition")],
                     [InlineKeyboardButton("📦", callback_data="my_products")]
                 ])
@@ -926,7 +955,7 @@ class MarketBot:
 
         # Запрашиваем подтверждение
         keyboard = [
-            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{location_id}")],
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_location_{location_id}")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel_delete")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -946,6 +975,48 @@ class MarketBot:
             "Операция отменена. Используйте /start для начала.",
             reply_markup=ReplyKeyboardRemove()
         )
+
+    async def skip_command(self, update: Update, context):
+        """Пропуск текущего шага"""
+        state = context.user_data.get('state')
+
+        if state == 'ADD_CHANNEL_DESCRIPTION':
+            # Пропускаем описание канала
+            if update.callback_query:
+                # Если вызван из callback
+                await self.save_channel(update, context, description="", is_callback=True)
+            else:
+                # Если вызвано командой /skip
+                await self.save_channel(update, context, description="", is_callback=False)
+        elif state == 'EDIT_CHANNEL_DESCRIPTION':
+            # Пропускаем изменение описания
+            channel_id = context.user_data.get('editing_channel_id')
+            if channel_id:
+                # Сохраняем пустое описание
+                success = self.sheets_manager.update_channel(
+                    channel_id=channel_id,
+                    description=""
+                )
+
+                if success:
+                    await update.message.reply_text(
+                        "✅ Описание оставлено пустым!",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                else:
+                    await update.message.reply_text("❌ Ошибка при обновлении канала")
+
+                # Очищаем состояние
+                context.user_data.clear()
+
+                # Показываем обновленный список каналов
+                await self.show_channels_after_action(update, context)
+            else:
+                await update.message.reply_text("❌ Ошибка: ID канала не найден")
+        else:
+            await update.message.reply_text(
+                "На данном шаге пропуск недоступен. Используйте /cancel для отмены операции."
+            )
 
     async def confirm_delete_callback(self, update: Update, context):
         """Подтверждение удаления локации"""
@@ -3253,6 +3324,358 @@ class MarketBot:
                     await query.message.reply_text("❌ Ошибка при отображении результата улучшения контента")
                 except Exception as e3:
                     logger.error(f"Failed to send error message: {e3}")
+
+    # ============= Методы для управления каналами =============
+
+    async def channels_callback(self, update: Update, context):
+        """Обработчик кнопки МОИ КАНАЛЫ"""
+        query = update.callback_query
+        await query.answer()
+
+        user = update.effective_user
+        telegram_user_id = user.id
+
+        supplier = self.sheets_manager.get_supplier_by_telegram_id(telegram_user_id)
+
+        if not supplier:
+            await query.edit_message_text(
+                "❌ Вы не зарегистрированы. Пожалуйста, используйте команду /start для регистрации.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 В главное меню", callback_data="back_to_main")
+                ]])
+            )
+            return
+
+        # Получаем все supplier_id для пользователя
+        all_suppliers = self.sheets_manager.get_all_suppliers()
+        user_supplier_ids = []
+
+        for supp_record in all_suppliers:
+            if str(supp_record.get("telegram_user_id")) == str(telegram_user_id):
+                user_supplier_ids.append(supp_record.get("internal_id"))
+
+        # Получаем все каналы пользователя
+        all_channels = []
+        for supp_id in user_supplier_ids:
+            channels = self.sheets_manager.get_channels_by_supplier_id(supp_id)
+            all_channels.extend(channels)
+
+        if not all_channels:
+            text = (
+                "📺 *МОИ КАНАЛЫ*\n\n"
+                "У вас пока нет добавленных каналов.\n"
+                "Добавьте канал, чтобы в будущем использовать его для автопостинга контента."
+            )
+            keyboard = [[InlineKeyboardButton("➕ Добавить канал", callback_data="add_channel")]]
+        else:
+            text = "📺 *МОИ КАНАЛЫ*\n\n"
+            keyboard = []
+
+            for i, channel in enumerate(all_channels, 1):
+                username = channel.get('channel_username', '@unknown')
+                title = channel.get('channel_title', username)
+                description = channel.get('description', '')
+
+                text += f"*{i}.* {title}\n"
+                text += f"🔗 {username}\n"
+                if description:
+                    text += f"📝 {description}\n"
+                text += "\n"
+
+                # Кнопки управления для каждого канала
+                channel_buttons = [
+                    InlineKeyboardButton(f"✏️ Редактировать {i}", callback_data=f"edit_channel_{channel['channel_id']}"),
+                    InlineKeyboardButton(f"🗑️ Удалить {i}", callback_data=f"delete_channel_{channel['channel_id']}")
+                ]
+                keyboard.append(channel_buttons)
+
+            keyboard.append([InlineKeyboardButton("➕ Добавить канал", callback_data="add_channel")])
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад в профиль", callback_data="profile")])
+
+        await self.safe_edit_message_text(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    async def add_channel_callback(self, update: Update, context):
+        """Начать процесс добавления канала"""
+        query = update.callback_query
+        await query.answer()
+
+        context.user_data['state'] = 'ADD_CHANNEL_USERNAME'
+
+        text = (
+            "➕ *Добавление нового канала*\n\n"
+            "Пожалуйста, введите username канала в формате @channel_name\n\n"
+            "Пример: @my_channel"
+        )
+
+        await self.safe_edit_message_text(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="channels")
+            ]]),
+            parse_mode='Markdown'
+        )
+
+    async def get_channel_username(self, update: Update, context):
+        """Обработчик ввода username канала"""
+        if context.user_data.get('state') != 'ADD_CHANNEL_USERNAME':
+            return
+
+        username = update.message.text.strip()
+
+        # Валидация формата username
+        if not username.startswith('@'):
+            await update.message.reply_text(
+                "❌ Ошибка: username должен начинаться с @\n"
+                "Попробуйте еще раз или нажмите /cancel для отмены",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="channels")
+                ]])
+            )
+            return
+
+        # Сохраняем username и переходим к описанию
+        context.user_data['channel_username'] = username
+        context.user_data['state'] = 'ADD_CHANNEL_DESCRIPTION'
+
+        await update.message.reply_text(
+            f"✅ Канал {username} добавлен\n\n"
+            "Теперь введите описание канала (необязательно)\n"
+            "Или отправьте /skip чтобы пропустить",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_description")
+            ]])
+        )
+
+    async def get_channel_description(self, update: Update, context):
+        """Обработчик ввода описания канала"""
+        if context.user_data.get('state') != 'ADD_CHANNEL_DESCRIPTION':
+            return
+
+        description = update.message.text.strip()
+
+        # Сохраняем канал
+        await self.save_channel(update, context, description)
+
+    async def save_channel(self, update, context, description="", is_callback=False):
+        """Сохранение канала в Google Sheets"""
+        try:
+            # Определяем, откуда брать информацию о пользователе
+            if is_callback and update.callback_query:
+                user = update.callback_query.from_user
+                message = update.callback_query.message
+                reply_func = lambda text, reply_markup=None: (
+                    update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+                )
+            elif update.message:
+                user = update.effective_user
+                message = update.message
+                reply_func = lambda text, reply_markup=None: (
+                    update.message.reply_text(text, reply_markup=reply_markup)
+                )
+            else:
+                raise ValueError("No valid update source")
+
+            telegram_user_id = user.id
+
+            supplier = self.sheets_manager.get_supplier_by_telegram_id(telegram_user_id)
+
+            if not supplier:
+                await reply_func("❌ Ошибка: вы не зарегистрированы")
+                return
+
+            username = context.user_data.get('channel_username')
+            if not username:
+                await reply_func("❌ Ошибка: username не найден")
+                return
+
+            # Добавляем канал
+            channel_id = self.sheets_manager.add_channel(
+                supplier_internal_id=supplier['internal_id'],
+                channel_username=username,
+                description=description
+            )
+
+            if channel_id:
+                await reply_func(
+                    f"✅ Канал {username} успешно добавлен!\n\n"
+                    f"Теперь вы можете использовать его для автопостинга контента"
+                )
+
+                # Показываем обновленный список каналов только если это не callback
+                if not is_callback:
+                    await self.show_channels_after_action(update, context)
+            else:
+                await reply_func("❌ Ошибка при сохранении канала")
+
+            # Очищаем состояние
+            context.user_data.clear()
+
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении канала: {e}")
+            try:
+                if is_callback and update.callback_query:
+                    await update.callback_query.edit_message_text("❌ Произошла ошибка при сохранении канала")
+                elif update.message:
+                    await update.message.reply_text("❌ Произошла ошибка при сохранении канала")
+            except:
+                pass  # Игнорируем ошибки при отправке сообщения об ошибке
+
+    async def show_channels_after_action(self, update: Update, context):
+        """Показать список каналов после действия"""
+        # Получаем пользователя
+        user = update.effective_user
+
+        # Создаем новый update для channels_callback
+        from types import SimpleNamespace
+        mock_update = SimpleNamespace()
+        mock_update.effective_user = user
+        mock_update.callback_query = SimpleNamespace()
+        mock_update.callback_query.answer = lambda: None
+        mock_update.callback_query.from_user = user
+        mock_update.callback_query.edit_message_text = lambda text, reply_markup=None, parse_mode=None: (
+            update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        )
+        mock_update.callback_query.message = update.message
+
+        # Копируем контекст
+        mock_context = SimpleNamespace()
+        mock_context.user_data = context.user_data
+
+        # Вызываем channels_callback с mock объектами
+        await self.channels_callback(mock_update, mock_context)
+
+    async def edit_channel_callback(self, update: Update, context):
+        """Начать редактирование канала"""
+        query = update.callback_query
+        await query.answer()
+
+        channel_id = query.data.replace('edit_channel_', '')
+
+        # Получаем информацию о канале
+        channel = self.sheets_manager.get_channel_by_id(channel_id)
+
+        if not channel:
+            await self.safe_edit_message_text(
+                query,
+                "❌ Канал не найден",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Назад", callback_data="channels")
+                ]])
+            )
+            return
+
+        # Сохраняем ID канала и переходим к редактированию описания
+        context.user_data['editing_channel_id'] = channel_id
+        context.user_data['state'] = 'EDIT_CHANNEL_DESCRIPTION'
+
+        username = channel.get('channel_username', '')
+        current_description = channel.get('description', '')
+        title = channel.get('channel_title', username)
+
+        text = (
+            f"✏️ *Редактирование канала*\n\n"
+            f"📺 {title}\n"
+            f"🔗 {username}\n\n"
+            f"Текущее описание:\n{current_description if current_description else 'Нет описания'}\n\n"
+            f"Введите новое описание или отправьте /skip чтобы оставить без изменений"
+        )
+
+        await self.safe_edit_message_text(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="channels")
+            ]]),
+            parse_mode='Markdown'
+        )
+
+    async def update_channel_description(self, update: Update, context):
+        """Обновление описания канала"""
+        if context.user_data.get('state') != 'EDIT_CHANNEL_DESCRIPTION':
+            return
+
+        channel_id = context.user_data.get('editing_channel_id')
+        if not channel_id:
+            await update.message.reply_text("❌ Ошибка: ID канала не найден")
+            return
+
+        new_description = update.message.text.strip()
+
+        # Обновляем канал
+        success = self.sheets_manager.update_channel(
+            channel_id=channel_id,
+            description=new_description
+        )
+
+        if success:
+            await update.message.reply_text(
+                "✅ Описание канала обновлено!",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        else:
+            await update.message.reply_text("❌ Ошибка при обновлении канала")
+
+        # Очищаем состояние
+        context.user_data.clear()
+
+        # Показываем обновленный список каналов
+        await self.show_channels_after_action(update, context)
+
+    async def delete_channel_callback(self, update: Update, context):
+        """Обработка удаления канала"""
+        query = update.callback_query
+        await query.answer()
+
+        channel_id = query.data.replace('delete_channel_', '')
+
+        # Запрашиваем подтверждение
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_channel_{channel_id}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="channels")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await self.safe_edit_message_text(
+            query,
+            "⚠️ *Вы уверены, что хотите удалить этот канал?*\n\n"
+            "Это действие нельзя отменить",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def confirm_delete_channel_callback(self, update: Update, context):
+        """Подтверждение удаления канала"""
+        query = update.callback_query
+        await query.answer()
+
+        channel_id = query.data.replace('confirm_delete_channel_', '')
+
+        # Удаляем канал
+        success = self.sheets_manager.delete_channel(channel_id)
+
+        if success:
+            await self.safe_edit_message_text(
+                query,
+                "✅ Канал успешно удален",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Назад к каналам", callback_data="channels")
+                ]])
+            )
+        else:
+            await self.safe_edit_message_text(
+                query,
+                "❌ Ошибка при удалении канала",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Назад", callback_data="channels")
+                ]])
+            )
 
     def run(self):
         """Запуск бота"""

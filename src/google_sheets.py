@@ -19,6 +19,7 @@ class GoogleSheetsManager:
         # Получаем или создаем листы
         self.suppliers_sheet = self._get_or_create_sheet("suppliers")
         self.locations_sheet = self._get_or_create_sheet("locations")
+        self.channels_sheet = self._get_or_create_sheet("channels")
         self.products_sheet = self._get_or_create_sheet("products")
         self.content_usage_sheet = self._get_or_create_sheet("content_usage")
         self.content_limits_sheet = self._get_or_create_sheet("content_limits")
@@ -47,6 +48,12 @@ class GoogleSheetsManager:
         locations_headers = [
             "location_id", "supplier_internal_id", "market_name",
             "pavilion_number", "contact_phones"
+        ]
+
+        # Заголовки для листа channels
+        channels_headers = [
+            "channel_id", "supplier_internal_id", "channel_username",
+            "channel_title", "description", "created_at", "updated_at"
         ]
 
         # Заголовки для листа products (новая JSON-структура с контентом)
@@ -81,6 +88,12 @@ class GoogleSheetsManager:
                 self.locations_sheet.append_row(locations_headers)
         except:
             self.locations_sheet.append_row(locations_headers)
+
+        try:
+            if not self.channels_sheet.get_all_values():
+                self.channels_sheet.append_row(channels_headers)
+        except:
+            self.channels_sheet.append_row(channels_headers)
 
         try:
             if not self.products_sheet.get_all_values():
@@ -701,4 +714,141 @@ class GoogleSheetsManager:
 
         except Exception as e:
             logger.error(f"Ошибка при очистке старых записей: {e}")
+            return False  # ============= Методы для работы с каналами =============
+
+    def add_channel(self, supplier_internal_id, channel_username, channel_title=None, description=""):
+        """Добавление нового канала"""
+        try:
+            from datetime import datetime
+            import uuid
+
+            channel_id = str(uuid.uuid4())
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # Очищаем username от @ если он есть
+            username = channel_username.lstrip('@')
+
+            row = [
+                channel_id,
+                supplier_internal_id,
+                f"@{username}",  # Сохраняем с @
+                channel_title or f"@{username}",
+                description,
+                current_time,
+                current_time
+            ]
+
+            self.channels_sheet.append_row(row)
+            logger.info(f"Канал {channel_username} добавлен для поставщика {supplier_internal_id}")
+            return channel_id
+
+        except Exception as e:
+            logger.error(f"Ошибка при добавлении канала: {e}")
+            return None
+
+    def get_channels_by_supplier_id(self, supplier_internal_id):
+        """Получение всех каналов поставщика"""
+        try:
+            cache_key = f"channels_{supplier_internal_id}"
+            current_time = time.time()
+
+            # Проверяем кеш
+            if cache_key in self._cache:
+                cached_data, cache_time = self._cache[cache_key]
+                if current_time - cache_time < self._cache_timeout:
+                    return cached_data
+
+            all_records = self.channels_sheet.get_all_records()
+            channels = []
+
+            for record in all_records:
+                if record.get("supplier_internal_id") == supplier_internal_id:
+                    channels.append(dict(record))
+
+            # Сохраняем в кеш
+            self._cache[cache_key] = (channels, current_time)
+            return channels
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении каналов: {e}")
+            return []
+
+    def delete_channel(self, channel_id):
+        """Удаление канала"""
+        try:
+            all_records = self.channels_sheet.get_all_records()
+
+            for i, record in enumerate(all_records):
+                if record.get("channel_id") == channel_id:
+                    # Получаем список всех строк
+                    all_values = self.channels_sheet.get_all_values()
+
+                    # Удаляем строку (i + 1 т.к. пропускаем заголовок)
+                    del all_values[i + 1]
+
+                    # Очищаем весь лист и записываем обновленные данные
+                    self.channels_sheet.clear()
+                    self.channels_sheet.append_rows(all_values)
+
+                    # Очищаем кеш
+                    self._cache.clear()
+
+                    logger.info(f"Канал {channel_id} удален")
+                    return True
+
+            logger.warning(f"Канал {channel_id} не найден")
             return False
+
+        except Exception as e:
+            logger.error(f"Ошибка при удалении канала: {e}")
+            return False
+
+    def update_channel(self, channel_id, description=None):
+        """Обновление информации о канале"""
+        try:
+            all_records = self.channels_sheet.get_all_records()
+
+            for i, record in enumerate(all_records):
+                if record.get("channel_id") == channel_id:
+                    row_num = i + 2  # +2 т.к. нумерация с 1 и есть заголовок
+
+                    # Получаем текущую строку
+                    current_row = self.channels_sheet.row_values(row_num)
+
+                    # Обновляем описание если нужно
+                    if description is not None:
+                        current_row[4] = description  # description это 5-й столбец
+                        # Обновляем updated_at
+                        from datetime import datetime
+                        current_row[6] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                        # Обновляем строку
+                        self.channels_sheet.update(f"A{row_num}:G{row_num}", [current_row])
+
+                    # Очищаем кеш
+                    self._cache.clear()
+
+                    logger.info(f"Канал {channel_id} обновлен")
+                    return True
+
+            logger.warning(f"Канал {channel_id} не найден")
+            return False
+
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении канала: {e}")
+            return False
+
+    def get_channel_by_id(self, channel_id):
+        """Получение канала по ID"""
+        try:
+            all_records = self.channels_sheet.get_all_records()
+
+            for record in all_records:
+                if record.get("channel_id") == channel_id:
+                    return dict(record)
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении канала: {e}")
+            return None
