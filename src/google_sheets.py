@@ -100,6 +100,15 @@ class GoogleSheetsManager:
         except:
             self.content_limits_sheet.append_row(content_limits_headers)
 
+    def _safe_int(self, value, default=1):
+        """Безопасное преобразование в int"""
+        try:
+            if value is None or value == '':
+                return default
+            return int(str(value).strip() or default)
+        except (ValueError, TypeError):
+            return default
+
     def add_supplier(self, internal_id, telegram_user_id, telegram_username, contact_name):
         """Добавление нового поставщика"""
         from datetime import datetime
@@ -470,7 +479,7 @@ class GoogleSheetsManager:
             return False
 
     def update_product_enhanced_content(self, product_id: str, enhanced_image_url: str = None,
-                                       enhanced_description: str = None, content_generated_at: str = None):
+                                       enhanced_description: str = None, content_generated_at: str = None, marketing_text: str = None):
         """Обновить улучшенный контент товара"""
         try:
             all_records = self.products_sheet.get_all_records()
@@ -496,16 +505,22 @@ class GoogleSheetsManager:
                         enhanced_image_url if enhanced_image_url else record.get('enhanced_image_url', ''),
                         enhanced_description if enhanced_description else record.get('enhanced_description', ''),
                         content_generated_at if content_generated_at else record.get('content_generated_at', ''),
-                        str(int(record.get('content_version', 1)) + 1) if enhanced_image_url or enhanced_description else record.get('content_version', 1)
+                        str(self._safe_int(record.get('content_version')) + 1) if enhanced_image_url or enhanced_description else str(self._safe_int(record.get('content_version')))
                     ]
 
-                    # Обновляем только новые поля (колонки M-P)
-                    self.products_sheet.update(f"M{row_num}:P{row_num}", [
+                    # Добавляем маркетинговый текст в current_data
+                    marketing_text_value = marketing_text if marketing_text else record.get('marketing_text', '')
+                    current_data.append(marketing_text_value)
+
+                    # Обновляем только новые поля (колонки M-Q)
+                    # ВАЖНО: Google Sheets API требует двойной список [[...]]
+                    self.products_sheet.update(f"M{row_num}:Q{row_num}", [[
                         current_data[12],  # enhanced_image_url
                         current_data[13],  # enhanced_description
                         current_data[14],  # content_generated_at
-                        current_data[15]   # content_version
-                    ])
+                        current_data[15],  # content_version
+                        current_data[16]   # marketing_text
+                    ]])
 
                     logger.info(f"Обновлен улучшенный контент для товара {product_id}")
                     return True

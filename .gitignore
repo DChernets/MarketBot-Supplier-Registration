@@ -30,7 +30,15 @@ logs/
 *.log
 
 # Google credentials
-config/google_credentials.json
+config/google_*.json
+config/oauth_tokens.json
+
+# Images
+enhanced_images/
+*.jpg
+*.jpeg
+*.png
+*.gif
 
 # OS
 .DS_Store

@@ -46,8 +46,9 @@ class ContentGenerationService:
 
         # Настройки генерации изображений
         self.image_generation_config = {
-            "temperature": 0.8,
-            "candidate_count": 1,
+            "temperature": 0.7,  # Оптимизировано для B2B профессионального контента (баланс креативности и стабильности)
+            "candidateCount": 1,
+            "responseModalities": ["IMAGE"],  # Для получения изображения от Gemini 2.5 Flash Image
         }
 
         logger.info("Сервис генерации контента инициализирован с Gemini Vision HTTP API")
@@ -190,18 +191,36 @@ class ContentGenerationService:
             )
 
             # Обрабатываем ответ
+            logger.info(f"🔍 Структура ответа от Gemini: keys={list(response_json.keys())}")
+
             if 'candidates' in response_json and response_json['candidates']:
                 candidate = response_json['candidates'][0]
+                logger.info(f"🔍 Candidate keys: {list(candidate.keys())}")
+
                 if 'content' in candidate and 'parts' in candidate['content']:
-                    for part in candidate['content']['parts']:
+                    parts = candidate['content']['parts']
+                    logger.info(f"🔍 Найдено {len(parts)} parts в ответе")
+
+                    for i, part in enumerate(parts):
+                        logger.info(f"🔍 Part {i} keys: {list(part.keys())}")
+
                         if 'inlineData' in part and part['inlineData']:
+                            inline_data = part['inlineData']
+                            logger.info(f"🔍 inlineData keys: {list(inline_data.keys())}")
+
                             # Получаем байты изображения
-                            if 'data' in part['inlineData']:
-                                enhanced_bytes = base64.b64decode(part['inlineData']['data'])
-                                logger.info(f"Успешно сгенерировано изображение через Gemini Vision")
+                            if 'data' in inline_data:
+                                data_length = len(inline_data['data'])
+                                logger.info(f"🔍 Найдено изображение! Размер base64 данных: {data_length} символов")
+                                enhanced_bytes = base64.b64decode(inline_data['data'])
+                                logger.info(f"✅ Успешно сгенерировано изображение через Gemini Vision. Размер: {len(enhanced_bytes)} байт")
                                 return enhanced_bytes
 
-            logger.warning("Gemini Vision не вернул изображение")
+                        if 'text' in part:
+                            logger.info(f"🔍 Part {i} содержит текст (первые 100 символов): {part['text'][:100]}")
+
+            logger.warning("⚠️ Gemini Vision не вернул изображение. Полный ответ для отладки сохранен в логах")
+            logger.debug(f"Полный ответ от Gemini: {json.dumps(response_json, indent=2, ensure_ascii=False)[:1000]}")
             return None
 
         except Exception as e:
@@ -305,60 +324,136 @@ class ContentGenerationService:
             raise ValueError(f"Не удалось обработать изображение: {e}")
 
     def _create_image_generation_prompt(self, product_info: Dict[str, Any], background_type: str) -> str:
-        """Создать промпт для генерации изображения"""
-
-        base_prompt = f"""
-        Ты - профессиональный фотограф товаров и дизайнер. Создай улучшенное изображение товара для маркетинга.
-
-        Информация о товаре:
-        - Название: {product_info.get('название', 'Неизвестный товар')}
-        - Описание: {product_info.get('описание', 'Нет описания')}
-        - Материал: {product_info.get('материал', 'Не указано')}
-        - Размеры: {product_info.get('размеры', 'Не указано')}
-        - Производство: {product_info.get('производство', 'Не указано')}
         """
+        Создать промпт для редактирования изображения товара с нарративным подходом
 
-        background_prompts = {
-            "professional_studio": """
-            Тип фона: Профессиональная студия
-            Создай изображение в стиле профессиональной предметной фотографии с чистым, светлым фоном.
-            Хорошие освещение, минимальные тени, фокус на качестве товара.
-            """,
+        Использует принцип "Describe the scene, don't just list keywords" (Google Gemini 2.5 Flash best practices 2025).
+        Промпт составлен на английском языке с профессиональными фотографическими терминами
+        для максимальной эффективности генерации через Gemini 2.5 Flash Image.
 
-            "marketing_showcase": """
-            Тип фона: Маркетинговая витрина
-            Создай привлекательное изображение товара на маркетинговом фоне.
-            Используй мягкое освещение, эстетичную композицию, возможно с элементами декора.
-            """,
+        Args:
+            product_info: Информация о товаре (название, материал, описание)
+            background_type: Тип фона (в текущей версии не используется, настройки берутся из категории)
 
-            "lifestyle_context": """
-            Тип фона: Lifestyle контекст
-            Размести товар в реальном контексте использования.
-            Создай атмосферу, показывающую как товар выглядит в быту или работе.
-            """,
-
-            "minimalist": """
-            Тип фона: Минимализм
-            Создай минималистичное изображение с фокусом на форме и текстуре товара.
-            Используй нейтральный фон, чистые линии, акцент на деталях.
-            """
-        }
-
-        background_prompt = background_prompts.get(background_type, background_prompts["professional_studio"])
-
-        full_prompt = f"""
-        {base_prompt}
-
-        {background_prompt}
-
-        Требования:
-        1. Сохрани узнаваемость оригинального товара
-        2. Улуччи качество изображения, освещение и композицию
-        3. Создай профессиональный вид, подходящий для маркетинга
-        4. В результате должно получиться улучшенное изображение товара
+        Returns:
+            str: Детальный нарративный промпт для Gemini 2.5 Flash Image
         """
+        product_name = product_info.get('название', 'товар')
+        product_material = product_info.get('материал', '')
+        product_description = product_info.get('описание', '')
 
-        return full_prompt
+        # Получаем категориально-специфичные настройки
+        category_settings = self._get_category_photography_settings(product_info)
+
+        # Формируем информацию о материале и описании
+        material_line = f"MATERIAL: {product_material}" if product_material and product_material != "Не указано" else ""
+        description_line = f"DESCRIPTION: {product_description}" if product_description and product_description != "Не указано" else ""
+
+        prompt = f"""You are a professional product photographer specializing in B2B wholesale e-commerce imagery for Russian marketplaces.
+
+PRODUCT INFORMATION:
+- Product: {product_name}
+{material_line}
+{description_line}
+
+PHOTOGRAPHY SCENE DESCRIPTION:
+Imagine a professional product photoshoot in a high-end studio environment. {category_settings['scene_description']} The setting conveys premium quality and reliability that B2B wholesale buyers expect from their suppliers.
+
+CAMERA SETUP:
+The product is captured using {category_settings['lens_type']} from {category_settings['camera_angle']}, positioned to showcase the product's key features, dimensions, and material quality. The composition follows {category_settings['composition_style']}, with the product occupying 70-80% of the frame as the hero element.
+
+LIGHTING DESIGN:
+Professional three-point lighting setup creates dimensional depth:
+- Main key light from large softbox positioned at 45-degree angle above-front, delivering soft directional illumination that reveals texture and form
+- Fill light at quarter intensity from opposite side, preventing harsh shadows while maintaining natural depth
+- Subtle rim light accentuating product edges and emphasizing {product_material if product_material and product_material != 'Не указано' else 'material'} texture
+- Natural-looking shadows falling at 30-degree angle, adding dimensionality without distraction
+- Gentle highlights and reflections that showcase craftsmanship and material quality
+
+BACKGROUND & ENVIRONMENT:
+{category_settings['background_description']}
+The composition is clean and distraction-free, with all extraneous objects, hands, watermarks, text, and graphic elements completely removed.
+
+VISUAL QUALITY & COLOR GRADING:
+- High-resolution macro-level detail revealing texture, weave, finish quality, and craftsmanship
+- Rich, vibrant {category_settings['color_style']}
+- Sharp focus throughout the product with subtle depth of field effect on background
+- Natural contrast that makes product stand out clearly against background
+- Authentic, non-over-processed aesthetic meeting 2025 e-commerce photography standards
+- Professional color accuracy for true-to-life product representation
+
+MARKETPLACE OPTIMIZATION:
+The final image must meet professional standards for major Russian B2B wholesale marketplaces (Ozon, Wildberries, AliExpress) and Telegram wholesale catalog channels. The photography should convey premium quality, inspire confidence in product reliability, and create desire for wholesale purchase.
+
+CRITICAL CONSTRAINTS:
+- Do NOT alter the product itself - ONLY enhance the presentation, lighting, and environment
+- Do NOT add watermarks, logos, text overlays, or any graphic elements
+- Do NOT change product colors, shape, or inherent characteristics
+- Preserve authentic product appearance while optimizing visual appeal through professional photography technique
+- Focus on creating trust and desire through lighting, composition, and background rather than artificial manipulation
+
+The goal is professional catalog photography that makes wholesale buyers want to touch, examine, and order this product in bulk quantity."""
+
+        return prompt
+
+    def _get_category_photography_settings(self, product_info: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Получить категориально-специфичные фотографические настройки
+
+        На основе названия и материала товара определяет оптимальные настройки съемки:
+        - Тип объектива и угол камеры
+        - Описание сцены и фона
+        - Стиль композиции и цветокоррекции
+
+        Args:
+            product_info: Информация о товаре (название, материал, описание)
+
+        Returns:
+            Dict[str, str]: Словарь с фотографическими настройками для категории
+        """
+        product_name = product_info.get('название', '').lower()
+        product_material = product_info.get('материал', '').lower()
+
+        # Определяем категорию на основе названия и материала
+        if any(word in product_name for word in ['бокал', 'стакан', 'ваза', 'посуд', 'тарелка', 'чашка', 'кружка', 'стекл']):
+            return {
+                'scene_description': 'The glass/dishware item is positioned on a pristine white marble surface with subtle natural veining, creating an elegant foundation.',
+                'lens_type': 'macro lens (100mm equivalent)',
+                'camera_angle': 'slightly elevated 20-degree angle',
+                'composition_style': 'dynamic 5-degree tilt for visual energy',
+                'background_description': 'Bright, clean white background with subtle gradient to light gray at edges, suggesting modern kitchen environment. Soft natural window light aesthetic creating crystal-clear transparency and elegant reflections that showcase glass quality.',
+                'color_style': 'bright, high-contrast with enhanced clarity for glass transparency and reflections'
+            }
+
+        elif any(word in product_name for word in ['ткань', 'текстиль', 'полотенце', 'постельное', 'одеяло', 'подушка', 'плед']):
+            return {
+                'scene_description': 'The textile product is artfully arranged on natural wooden surface, showcasing fabric texture, drape, and tactile quality.',
+                'lens_type': '85mm portrait lens',
+                'camera_angle': 'eye-level with slight 10-degree elevation',
+                'composition_style': 'gentle organic arrangement highlighting fabric flow and softness',
+                'background_description': 'Warm neutral background (light beige to soft gray) with natural wood texture accent. Soft diffused lighting mimicking natural daylight from window, creating gentle shadows that emphasize textile softness and weave detail.',
+                'color_style': 'warm, natural tones with emphasis on fabric texture detail and material quality'
+            }
+
+        elif any(word in product_name for word in ['электро', 'гаджет', 'провод', 'зарядка', 'устройство', 'техник']):
+            return {
+                'scene_description': 'The electronic item is placed on sleek modern surface in minimalist tech-forward environment.',
+                'lens_type': 'standard 50mm lens with precise focus',
+                'camera_angle': 'straight-on eye-level for geometric precision',
+                'composition_style': 'perfectly centered alignment emphasizing clean lines and technical precision',
+                'background_description': 'Minimalist gradient background transitioning from pure white at center to light cool gray at edges. Tech-aesthetic lighting with subtle blue undertones suggesting precision, innovation, and modernity.',
+                'color_style': 'crisp, high-contrast with slight cool color temperature for modern tech aesthetic'
+            }
+
+        else:  # Универсальные товары
+            return {
+                'scene_description': 'The product is positioned on clean professional surface in neutral studio environment.',
+                'lens_type': 'standard 50mm lens',
+                'camera_angle': 'slightly elevated 15-degree angle for optimal perspective',
+                'composition_style': 'centered with subtle asymmetric placement for visual interest',
+                'background_description': 'Clean professional white to light gray background with soft gradient. Studio lighting setup creating modern, fresh aesthetic suitable for any product category.',
+                'color_style': 'balanced, true-to-life colors with enhanced vibrancy'
+            }
 
     def _create_description_prompt(self, product_info: Dict[str, Any]) -> str:
         """Создать промпт для генерации описания товара"""
@@ -434,17 +529,22 @@ class ContentGenerationService:
 
             enhanced_info = product_info.copy()
 
-            # TODO: Gemini не может генерировать изображения с нуля
-            # Временно отключаем генерацию изображений
+            # Генерация улучшенного изображения через Gemini 2.5 Flash Image
             if generate_image and product_image_bytes:
-                logger.info("⚠️ Генерация изображений временно отключена - Gemini не создает изображения с нуля")
-                # enhanced_image = await self.generate_enhanced_image(
-                #     product_image_bytes,
-                #     product_info,
-                #     background_type="professional_studio"
-                # )
-                # if enhanced_image:
-                #     enhanced_info['enhanced_image_bytes'] = enhanced_image
+                logger.info("🖼️ Запускаем улучшение изображения через Gemini 2.5 Flash Image")
+                enhanced_image = await self.generate_enhanced_image(
+                    product_image_bytes,
+                    product_info,
+                    background_type="professional_studio"
+                )
+                if enhanced_image:
+                    enhanced_info['enhanced_image_bytes'] = enhanced_image
+                    logger.info("✅ Изображение успешно улучшено")
+                else:
+                    # Используем оригинальное изображение как fallback
+                    enhanced_info['enhanced_image_bytes'] = product_image_bytes
+                    enhanced_info['enhanced_original'] = True
+                    logger.warning("⚠️ Не удалось улучшить изображение, используем оригинальное")
 
             # Генерация описания
             if generate_description:

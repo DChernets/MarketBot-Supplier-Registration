@@ -5,12 +5,13 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_SHEETS_CREDENTIALS_FILE = os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "config/google_credentials.json")
+GOOGLE_SERVICE_ACCOUNT_2_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_2_FILE", "config/google_service_account_2.json")
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
 # Google Gemini API Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_RECOGNITION_MODEL = os.getenv("GEMINI_RECOGNITION_MODEL", "gemini-2.0-flash-exp")
+GEMINI_RECOGNITION_MODEL = os.getenv("GEMINI_RECOGNITION_MODEL", "gemini-2.5-flash")
 GEMINI_CONTENT_GENERATION_MODEL = os.getenv("GEMINI_CONTENT_GENERATION_MODEL", "gemini-2.5-flash-image")
 
 # Google Drive Configuration
@@ -26,7 +27,17 @@ SUPPORTED_PHOTO_FORMATS = ['jpg', 'jpeg', 'png', 'webp']
 PHOTO_QUALITY = 85
 
 # Google Drive Folder Settings
-DRIVE_FOLDER_NAME = "MarketBot Images"
+DRIVE_FOLDER_NAME = "MarketBot Images"  # Deprecated - use GOOGLE_DRIVE_MARKETBOT_FOLDER_ID
+
+# New Google Drive Structure
+GOOGLE_DRIVE_MARKETBOT_FOLDER_ID = os.getenv("GOOGLE_DRIVE_MARKETBOT_FOLDER_ID")
+DRIVE_ENHANCED_IMAGES_SUBFOLDER = "Enhanced_Images"
+LOCAL_ENHANCED_IMAGES_PATH = "/root/myAI/MarketBot/enhanced_images"
+
+# OAuth Settings
+USE_OAUTH_FOR_DRIVE = os.getenv("USE_OAUTH_FOR_DRIVE", "True").lower() == "true"
+GOOGLE_OAUTH_CREDENTIALS_FILE = os.getenv("GOOGLE_OAUTH_CREDENTIALS_FILE", "config/google_oauth_credentials.json")
+GOOGLE_OAUTH_TOKENS_FILE = os.getenv("GOOGLE_OAUTH_TOKENS_FILE", "config/oauth_tokens.json")
 
 # Proxy Settings
 USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"

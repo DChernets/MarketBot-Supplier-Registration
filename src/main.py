@@ -4,9 +4,10 @@ import uuid
 import asyncio
 import requests
 from io import BytesIO
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler
-from src.config import TELEGRAM_BOT_TOKEN, DEBUG, ENABLE_CONTENT_GENERATION, AUTO_GENERATE_CONTENT
+from src.config import TELEGRAM_BOT_TOKEN, DEBUG, ENABLE_CONTENT_GENERATION, AUTO_GENERATE_CONTENT, LOCAL_ENHANCED_IMAGES_PATH
 from src.google_sheets import GoogleSheetsManager
 from src.gemini_service import get_gemini_service, initialize_gemini_service
 from src.image_storage import get_image_storage_service, initialize_image_storage
@@ -377,7 +378,7 @@ class MarketBot:
         elif query.data in ['add_location', 'cancel_registration']:
             logger.info(f"DEBUG: Redirecting to add_location_callback")
             await self.add_location_callback(update, context)
-        elif query.data in ['edit_supplier', 'add_location_post']:
+        elif query.data == 'add_location_post':
             logger.info(f"DEBUG: Redirecting to post_registration_callback")
             await self.post_registration_callback(update, context)
         else:
@@ -454,7 +455,7 @@ class MarketBot:
         elif query.data in ['edit_market_name', 'edit_pavilion_number', 'manage_phones']:
             logger.info(f"handle_callback: calling handle_edit_options")
             await self.handle_edit_options(update, context)
-        elif query.data in ['edit_supplier', 'add_location_post']:
+        elif query.data == 'add_location_post':
             logger.info(f"handle_callback: calling post_registration_callback")
             await self.post_registration_callback(update, context)
         elif query.data == 'photo_recognition':
@@ -665,8 +666,7 @@ class MarketBot:
             )
 
             keyboard = [
-                [InlineKeyboardButton("📝 ИЗМЕНИТЬ ИНФОРМАЦИЮ ПОСТАВЩИКА", callback_data="edit_supplier")],
-                [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")]
+                                [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -743,12 +743,7 @@ class MarketBot:
 
         await query.answer()
 
-        if query.data == "edit_supplier":
-            await query.edit_message_text(
-                "🔧 Функция редактирования будет добавлена в следующей версии.\n"
-                "Пока используйте /start для создания новой регистрации."
-            )
-        elif query.data == "add_location":
+        if query.data == "add_location":
             await query.edit_message_text(
                 "➕ Для добавления новой точки начните регистрацию заново с /start\n"
                 "В будущем будет добавлена функция добавления точек для существующих пользователей."
@@ -842,9 +837,8 @@ class MarketBot:
 
                 # Добавляем общие кнопки управления
                 keyboard.extend([
-                    [InlineKeyboardButton("📝 ИЗМЕНИТЬ ИНФОРМАЦИЮ ПОСТАВЩИКА", callback_data="edit_supplier")],
-                    [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")],
-                    [InlineKeyboardButton("📸 ФОТО", callback_data="photo_recognition")],
+                                        [InlineKeyboardButton("➕ ДОБАВИТЬ НОВУЮ ТОЧКУ", callback_data="add_location")],
+                    [InlineKeyboardButton("📸", callback_data="photo_recognition")],
                     [InlineKeyboardButton("📦", callback_data="my_products")]
                 ])
 
@@ -1392,6 +1386,11 @@ class MarketBot:
                     title = result.get('название', 'Неизвестный товар')
                     description = result.get('описание', 'Нет описания')
 
+                    # Показываем улучшенное описание, если есть
+                    if result.get('generated_description'):
+                        description = result['generated_description']
+                        message += "✨ *Улучшенное описание:*\n"
+
                     # Собираем дополнительную информацию
                     details = []
                     production = result.get('производство', '')
@@ -1401,10 +1400,19 @@ class MarketBot:
                     if material and material != 'Не указано':
                         details.append(f"🧪 {material}")
 
+                    # Показываем маркетинговый текст, если есть
+                    marketing_text = result.get('marketing_text', '')
+                    if marketing_text:
+                        details.append(f"🎯 {marketing_text}")
+
                     message += f"📷 *Товар {i}: {title}*\n"
                     message += f"📝 {description}\n"
                     if details:
                         message += f"🏷️ {' | '.join(details)}\n"
+
+                    # Показываем статус улучшения изображения
+                    if result.get('has_enhanced_image'):
+                        message += "🖼️ *Изображение улучшено*\n"
                 else:
                     # Старая структура (обратная совместимость)
                     short_desc = result.get('short_description', 'Неизвестный товар')
@@ -1517,16 +1525,16 @@ class MarketBot:
                 logger.info(f"No products found for supplier {supplier_id}")
                 await self.safe_edit_message_text(
                     query,
-                    "📦 Мои товары\n\n"
+                    "Мои товары 📦\n\n"
                     "У вас пока нет сохраненных товаров.\n\n"
-                    "Используйте кнопку 📸 ФОТО для добавления товаров."
+                    "Используйте кнопку 📸 для добавления товаров."
                 )
                 return
 
             # Сначала редактируем текущее сообщение на заголовок
             await self.safe_edit_message_text(
                 query,
-                f"📦 Мои товары ({len(products)} шт.)\n\n"
+                f"Мои товары 📦 ({len(products)} шт.)\n\n"
                 "Загружаю изображения...",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("⬅️ Назад", callback_data="back_to_profile")
@@ -1590,7 +1598,7 @@ class MarketBot:
                     if enhanced_image_url and str(enhanced_image_url).startswith('local:'):
                         # Извлекаем имя файла из "local:filename"
                         filename = str(enhanced_image_url).replace('local:', '')
-                        enhanced_local_path = f"/root/myAI/MarketBot/enhanced_images/{filename}"
+                        enhanced_local_path = f"{LOCAL_ENHANCED_IMAGES_PATH}/{filename}"
                         # Проверяем существование файла
                         import os
                         if not os.path.exists(enhanced_local_path):
@@ -2070,6 +2078,57 @@ class MarketBot:
             if self.gemini_service:
                 try:
                     recognition_results = await self.gemini_service.recognize_multiple_products(photo_bytes_list)
+
+                    # Улучшаем контент сразу после распознавания
+                    if ENABLE_CONTENT_GENERATION and self.content_generation_service:
+                        # Определяем тип update для ответа
+                        if hasattr(update, 'callback_query') and update.callback_query:
+                            await update.callback_query.edit_message_text("🔄 Распознавание завершено. Улучшаю контент...")
+                        else:
+                            await update.message.reply_text("🔄 Распознавание завершено. Улучшаю контент...")
+
+                        # Улучшаем каждый распознанный товар
+                        for i, result in enumerate(recognition_results):
+                            try:
+                                user_id = update.effective_user.id
+                                product_id = str(uuid.uuid4())  # Временный ID для товара
+
+                                # Проверяем лимиты
+                                limit_check = self.content_generation_service.usage_limits.check_daily_limit(
+                                    user_id, product_id, 'content_enhancement'
+                                )
+
+                                if limit_check['allowed']:
+                                    # Запускаем улучшение контента
+                                    enhanced_result = await self.content_generation_service.enhance_product_content(
+                                        product_info=result,
+                                        product_image_bytes=photo_bytes_list[i],
+                                        generate_image=True,
+                                        generate_description=True,
+                                        generate_marketing=True
+                                    )
+
+                                    # Обновляем результат улучшенными данными
+                                    recognition_results[i] = enhanced_result
+
+                                    # Если есть улучшенное изображение, сохраняем его временно
+                                    if enhanced_result.get('enhanced_image_bytes'):
+                                        recognition_results[i]['enhanced_image_bytes'] = enhanced_result['enhanced_image_bytes']
+                                        recognition_results[i]['has_enhanced_image'] = True
+
+                                    if enhanced_result.get('generated_description'):
+                                        recognition_results[i]['has_enhanced_description'] = True
+
+                                    if enhanced_result.get('marketing_text'):
+                                        recognition_results[i]['has_marketing_text'] = True
+
+                                else:
+                                    logger.info(f"Content generation limit reached for photo {i+1}")
+
+                            except Exception as e:
+                                logger.error(f"Error enhancing content for photo {i+1}: {e}")
+                                # Продолжаем с оригинальным результатом
+
                 except Exception as e:
                     logger.error(f"Error in gemini service: {e}")
                     # Fallback - улучшенные заглушки с подсказками
@@ -2152,13 +2211,13 @@ class MarketBot:
                 # Создаем клавиатуру с кнопками управления
                 keyboard = [
                     [InlineKeyboardButton("📦", callback_data="my_products")],
-                    [InlineKeyboardButton("📍 МОИ ЛОКАЦИИ", callback_data="my_locations")],
-                    [InlineKeyboardButton("📸 ФОТО", callback_data="photo_recognition")]
+                    [InlineKeyboardButton("📍", callback_data="my_locations")],
+                    [InlineKeyboardButton("📸", callback_data="photo_recognition")]
                 ]
 
                 # Добавляем кнопку регистрации если товаров еще нет
                 if product_count == 0:
-                    keyboard.insert(1, [InlineKeyboardButton("➕ ДОБАВИТЬ ТОВАР", callback_data="photo_recognition")])
+                    keyboard.insert(1, [InlineKeyboardButton("➕", callback_data="photo_recognition")])
 
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2276,6 +2335,36 @@ class MarketBot:
                 except Exception as e:
                     logger.warning(f"Failed to get Telegram URL for image: {e}")
 
+                # Если есть улучшенное изображение в recognition_results, сохраняем его
+                enhanced_image_url = None
+                if result.get('enhanced_image_bytes') and self.image_storage_service:
+                    try:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"enhanced_{product_id}_{timestamp}.jpg"
+
+                        # Загружаем в Google Drive
+                        enhanced_image_url = await self.image_storage_service.upload_image(
+                            image_bytes=result['enhanced_image_bytes'],
+                            filename=filename,
+                            product_id=product_id
+                        )
+
+                        if enhanced_image_url:
+                            logger.info(f"✅ Enhanced image uploaded to Drive: {enhanced_image_url[:60]}...")
+                        else:
+                            logger.error("Failed to upload enhanced image to Drive")
+
+                    except Exception as e:
+                        logger.error(f"Error uploading enhanced image: {e}")
+
+                # Обновляем product_data с улучшенным контентом
+                if enhanced_image_url:
+                    product_data['enhanced_image_url'] = enhanced_image_url
+                if result.get('generated_description'):
+                    product_data['enhanced_description'] = result['generated_description']
+                if result.get('marketing_text'):
+                    product_data['marketing_text'] = result['marketing_text']
+
                 # Сохраняем в Google Sheets с новой структурой
                 success = self.sheets_manager.add_product(
                     product_id=product_id,
@@ -2285,15 +2374,30 @@ class MarketBot:
                     image_urls=image_urls
                 )
 
+                # Если есть улучшенный контент, обновляем запись в Sheets
+                if success and (enhanced_image_url or result.get('generated_description') or result.get('marketing_text')):
+                    try:
+                        self.sheets_manager.update_product_enhanced_content(
+                            product_id=product_id,
+                            enhanced_image_url=enhanced_image_url,
+                            enhanced_description=result.get('generated_description'),
+                            marketing_text=result.get('marketing_text'),
+                            content_generated_at=datetime.now().isoformat()
+                        )
+                        logger.info(f"✅ Sheets updated with enhanced content for product {product_id}")
+                    except Exception as e:
+                        logger.error(f"Error updating enhanced content in sheets: {e}")
+
                 if success:
                     saved_products += 1
-                    # Сохраняем полные данные товара для автоматической генерации
-                    saved_product_data.append({
-                        'product_id': product_id,
-                        'product_info': product_data,
-                        'photo_urls': image_urls,
-                        'image_bytes': image_bytes
-                    })
+                    # Сохраняем полные данные товара для автоматической генерации (только если еще не было улучшения)
+                    if not result.get('has_enhanced_image') and not result.get('has_enhanced_description'):
+                        saved_product_data.append({
+                            'product_id': product_id,
+                            'product_info': product_data,
+                            'photo_urls': image_urls,
+                            'image_bytes': image_bytes
+                        })
 
             # Очищаем контекст
             context.user_data.clear()
@@ -2391,12 +2495,50 @@ class MarketBot:
                     )
 
                     if has_generated_content:
+                        enhanced_image_url = None
+
+                        # Сохраняем улучшенное изображение на Drive
+                        if result.get('enhanced_image_bytes'):
+                            try:
+                                from datetime import datetime
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                filename = f"enhanced_{product_id}_{timestamp}.jpg"
+
+                                # Загружаем в Google Drive
+                                enhanced_image_url = await self.image_storage_service.upload_image(
+                                    image_bytes=result['enhanced_image_bytes'],
+                                    filename=filename,
+                                    product_id=product_id
+                                )
+
+                                if enhanced_image_url:
+                                    logger.info(f"✅ Enhanced image uploaded to Drive: {enhanced_image_url[:60]}...")
+                                else:
+                                    logger.error("Failed to upload enhanced image to Drive")
+
+                            except Exception as e:
+                                logger.error(f"Error uploading enhanced image: {e}")
+
+                        # Обновляем Google Sheets с улучшенным контентом
+                        try:
+                            self.sheets_manager.update_product_enhanced_content(
+                                product_id=product_id,
+                                enhanced_image_url=enhanced_image_url,
+                                enhanced_description=result.get('generated_description'),
+                                marketing_text=result.get('marketing_text'),
+                                content_generated_at=datetime.now().isoformat()
+                            )
+                            logger.info(f"✅ Sheets updated for product {product_id}")
+                        except Exception as e:
+                            logger.error(f"Error updating Sheets: {e}")
+
                         enhanced_products.append({
                             'product_id': product_id,
                             'product_name': product.get('название', 'Товар'),
                             'enhanced_description': result.get('generated_description'),
                             'marketing_text': result.get('marketing_text'),
-                            'has_image': bool(result.get('enhanced_image_bytes'))
+                            'enhanced_image_url': enhanced_image_url,
+                            'has_image': bool(enhanced_image_url)
                         })
                         logger.info(f"Successfully enhanced content for product {product_id}")
                     else:
@@ -2463,7 +2605,7 @@ class MarketBot:
 
             caption += f"\n💡 Чтобы управлять контентом для всех товаров, используйте /my_products"
 
-            keyboard = [[InlineKeyboardButton("📦 Мои товары", callback_data="my_products")]]
+            keyboard = [[InlineKeyboardButton("📦", callback_data="my_products")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             if enhanced_image_url:
@@ -2654,7 +2796,7 @@ class MarketBot:
                             logger.error("Failed to upload enhanced image to Google Drive")
 
                     # 2. Сохраняем локально как резервную копию для быстрого доступа
-                    local_dir = "/root/myAI/MarketBot/enhanced_images"
+                    local_dir = LOCAL_ENHANCED_IMAGES_PATH
                     os.makedirs(local_dir, exist_ok=True)
 
                     enhanced_image_path = os.path.join(local_dir, filename)
@@ -2678,7 +2820,7 @@ class MarketBot:
                     filename = f"original_{product_id}_{timestamp}.jpg"
                     filename_for_local = filename  # Сохраняем для использования вне блока try
 
-                    local_dir = "/root/myAI/MarketBot/enhanced_images"
+                    local_dir = LOCAL_ENHANCED_IMAGES_PATH
                     os.makedirs(local_dir, exist_ok=True)
 
                     enhanced_image_path = os.path.join(local_dir, filename)
@@ -2878,7 +3020,7 @@ class MarketBot:
             if enhanced_image_url and str(enhanced_image_url).startswith('local:'):
                 # Извлекаем имя файла из "local:filename"
                 filename = str(enhanced_image_url).replace('local:', '')
-                enhanced_local_path = f"/root/myAI/MarketBot/enhanced_images/{filename}"
+                enhanced_local_path = f"{LOCAL_ENHANCED_IMAGES_PATH}/{filename}"
                 # Проверяем существование файла
                 import os
                 if not os.path.exists(enhanced_local_path):
@@ -3039,7 +3181,7 @@ class MarketBot:
             except Exception as save_error:
                 logger.error(f"Ошибка при сохранении улучшенного описания: {save_error}")
 
-            keyboard = [[InlineKeyboardButton("📦 Мои товары", callback_data="my_products")]]
+            keyboard = [[InlineKeyboardButton("📦", callback_data="my_products")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             # Если есть улучшенное изображение, показываем его

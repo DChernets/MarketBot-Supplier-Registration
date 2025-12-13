@@ -17,6 +17,6 @@ mkdir -p "$LOG_DIR"
 cd "$MAIN_DIR"
 
 # Запускаем бота (Python сам управляет ротацией логов)
-nohup python3 src/main.py > /dev/null 2>&1 &
+nohup python3 -m src.main > /dev/null 2>&1 &
 
 echo "Бот запущен с автоматической ротацией логов в $LOG_DIR/bot.log (макс. 5МБ на файл)"

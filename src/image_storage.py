@@ -7,8 +7,12 @@ import os
 import asyncio
 import aiofiles
 import logging
+import json
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as OAuthCredentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
@@ -16,7 +20,22 @@ from PIL import Image
 import io
 from datetime import datetime
 import uuid
-from src.config import GOOGLE_SHEETS_CREDENTIALS_FILE, GOOGLE_DRIVE_SCOPES, DRIVE_FOLDER_NAME, MAX_PHOTO_SIZE_MB, SUPPORTED_PHOTO_FORMATS, PHOTO_QUALITY, HTTP_PROXY, HTTPS_PROXY
+from src.config import (
+    GOOGLE_SHEETS_CREDENTIALS_FILE,
+    GOOGLE_SERVICE_ACCOUNT_2_FILE,
+    GOOGLE_DRIVE_SCOPES,
+    DRIVE_FOLDER_NAME,
+    GOOGLE_DRIVE_MARKETBOT_FOLDER_ID,
+    DRIVE_ENHANCED_IMAGES_SUBFOLDER,
+    USE_OAUTH_FOR_DRIVE,
+    GOOGLE_OAUTH_CREDENTIALS_FILE,
+    GOOGLE_OAUTH_TOKENS_FILE,
+    MAX_PHOTO_SIZE_MB,
+    SUPPORTED_PHOTO_FORMATS,
+    PHOTO_QUALITY,
+    HTTP_PROXY,
+    HTTPS_PROXY
+)
 
 # Configure proxy for Google APIs
 if HTTP_PROXY or HTTPS_PROXY:
@@ -34,12 +53,81 @@ class ImageStorageService:
     def __init__(self):
         """Инициализация сервиса"""
         self.scopes = GOOGLE_DRIVE_SCOPES
-        self.creds = Credentials.from_service_account_file(
-            GOOGLE_SHEETS_CREDENTIALS_FILE,
-            scopes=self.scopes
-        )
+        self.use_oauth = USE_OAUTH_FOR_DRIVE
+
+        # Выбираем метод авторизации
+        if self.use_oauth:
+            # OAuth авторизация (от имени пользователя)
+            self.creds = self._load_oauth_credentials()
+            logger.info("Используется OAuth авторизация для Google Drive")
+        else:
+            # Service Account авторизация
+            self.creds = Credentials.from_service_account_file(
+                GOOGLE_SHEETS_CREDENTIALS_FILE,
+                scopes=self.scopes
+            )
+            logger.info("Используется Service Account для Google Drive")
+
         self.drive_service: Optional[Resource] = None
-        self.folder_id: Optional[str] = None
+        self.marketbot_folder_id: Optional[str] = GOOGLE_DRIVE_MARKETBOT_FOLDER_ID  # Корневая папка MarketBot
+        self.folder_id: Optional[str] = None  # ID подпапки Enhanced_Images
+
+    def _load_oauth_credentials(self) -> Optional[OAuthCredentials]:
+        """Загрузка OAuth credentials из токенов"""
+        try:
+            tokens_file = Path(GOOGLE_OAUTH_TOKENS_FILE)
+
+            if not tokens_file.exists():
+                logger.error(f"Файл OAuth токенов не найден: {tokens_file}")
+                logger.error("Запустите: python3 get_oauth_token_manual.py")
+                return None
+
+            with open(tokens_file, 'r') as f:
+                token_data = json.load(f)
+
+            # Создаем credentials из токенов
+            creds = OAuthCredentials(
+                token=token_data.get('access_token'),
+                refresh_token=token_data.get('refresh_token'),
+                token_uri=token_data.get('token_uri'),
+                client_id=token_data.get('client_id'),
+                client_secret=token_data.get('client_secret'),
+                scopes=token_data.get('scopes', self.scopes)
+            )
+
+            # Проверяем и обновляем токен если нужно
+            if creds and creds.expired and creds.refresh_token:
+                logger.info("OAuth токен истек, обновляю...")
+                creds.refresh(Request())
+
+                # Сохраняем обновленные токены
+                self._save_oauth_tokens(creds, tokens_file)
+                logger.info("OAuth токен обновлен")
+
+            return creds
+
+        except Exception as e:
+            logger.error(f"Ошибка загрузки OAuth credentials: {e}")
+            return None
+
+    def _save_oauth_tokens(self, creds: OAuthCredentials, tokens_file: Path):
+        """Сохранение обновленных OAuth токенов"""
+        try:
+            token_data = {
+                'access_token': creds.token,
+                'refresh_token': creds.refresh_token,
+                'token_uri': creds.token_uri,
+                'client_id': creds.client_id,
+                'client_secret': creds.client_secret,
+                'scopes': list(creds.scopes) if creds.scopes else [],
+                'expiry': creds.expiry.isoformat() if creds.expiry else None
+            }
+
+            with open(tokens_file, 'w') as f:
+                json.dump(token_data, f, indent=2)
+
+        except Exception as e:
+            logger.error(f"Ошибка сохранения OAuth токенов: {e}")
 
     async def initialize(self) -> bool:
         """Инициализация сервиса и создание папки"""
@@ -49,8 +137,19 @@ class ImageStorageService:
             # Создаем сервис
             self.drive_service = build('drive', 'v3', credentials=self.creds)
 
-            # Создаем или получаем папку для изображений
-            self.folder_id = await self._get_or_create_folder()
+            # Новая логика: если задан GOOGLE_DRIVE_MARKETBOT_FOLDER_ID, создаем подпапку
+            if self.marketbot_folder_id:
+                logger.info(f"Используется корневая папка MarketBot: {self.marketbot_folder_id}")
+                # Создаем подпапку Enhanced_Images внутри MarketBot
+                self.folder_id = await self._create_subfolder_in_parent(
+                    parent_id=self.marketbot_folder_id,
+                    subfolder_name=DRIVE_ENHANCED_IMAGES_SUBFOLDER
+                )
+            else:
+                # Старая логика: создаем папку "MarketBot Images" в корне
+                logger.info("GOOGLE_DRIVE_MARKETBOT_FOLDER_ID не задан, используется старая логика")
+                self.folder_id = await self._get_or_create_folder()
+
             if self.folder_id:
                 logger.info(f"Google Drive сервис инициализирован. Folder ID: {self.folder_id}")
                 return True
@@ -107,6 +206,51 @@ class ImageStorageService:
 
         except Exception as e:
             logger.error(f"Ошибка при работе с папкой: {e}")
+            return None
+
+    async def _create_subfolder_in_parent(self, parent_id: str, subfolder_name: str) -> Optional[str]:
+        """Создать или получить подпапку внутри родительской папки"""
+        try:
+            # Ищем подпапку с нужным именем внутри parent_id
+            query = f"name='{subfolder_name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder'"
+            results = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.drive_service.files().list(
+                    q=query,
+                    spaces='drive',
+                    fields='files(id, name)'
+                ).execute()
+            )
+
+            folders = results.get('files', [])
+            if folders:
+                folder_id = folders[0]['id']
+                logger.info(f"Найдена существующая подпапка '{subfolder_name}': {folder_id}")
+                return folder_id
+
+            # Если подпапки нет, создаем новую
+            logger.info(f"Создание подпапки '{subfolder_name}' внутри {parent_id}")
+            folder_metadata = {
+                'name': subfolder_name,
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [parent_id]
+            }
+
+            folder = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.drive_service.files().create(
+                    body=folder_metadata,
+                    fields='id'
+                ).execute()
+            )
+
+            folder_id = folder.get('id')
+            logger.info(f"Создана подпапка '{subfolder_name}': {folder_id}")
+
+            return folder_id
+
+        except Exception as e:
+            logger.error(f"Ошибка при создании подпапки '{subfolder_name}': {e}")
             return None
 
     async def _make_folder_public(self, folder_id: str):
